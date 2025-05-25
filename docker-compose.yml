@@ -1,0 +1,74 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    volumes:
+      - ./frontend:/app
+      - /run/user/${UID}/wayland-0:/run/user/${UID}/wayland-0  # Mount the Wayland socket
+    environment:
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY}  # Pass Wayland display from the host
+      - XDG_RUNTIME_DIR=/run/user/${UID}    # Set the runtime directory for Wayland
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    env_file:
+      - .env
+    user: "${UID}:${GID}"
+    depends_on:
+      - backend
+
+  backend:
+    container_name: backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./backend:/app
+      - ./documents:/app/documents_storage:rw
+    ports:
+      - "3000:3000"
+      - "9229:9229"
+    environment:
+      - NODE_ENV=development
+    env_file:
+      - .env
+    restart: unless-stopped
+    user: "${UID}:${GID}"
+    depends_on:
+      - database
+
+  jobs:
+    container_name: jobs
+    build:
+      context: ./jobs
+      dockerfile: Dockerfile
+    volumes:
+      - ./jobs:/app
+      - ./documents:/app/documents_storage
+    environment:
+      - NODE_ENV=development
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+
+  database:
+    image: mongo:latest
+    container_name: database
+    ports:
+      - "27017:27017"
+    volumes:
+      - database-data:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=root
+      - MONGO_INITDB_ROOT_PASSWORD=example
+    restart: unless-stopped
+
+volumes:
+  database-data:
+

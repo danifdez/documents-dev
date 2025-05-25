@@ -1,0 +1,9 @@
+[submodule "frontend"]
+	path = frontend
+	url = https://github.com/danifdez/documents-frontend.git
+[submodule "backend"]
+	path = backend
+	url = https://github.com/danifdez/documents-backend.git
+[submodule "jobs"]
+	path = jobs
+	url = https://github.com/danifdez/documents-jobs.git
