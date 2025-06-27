@@ -95,6 +95,20 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
+  
+  playground:
+    container_name: playground
+    profiles: ["local"]
+    build:
+      context: ./playground
+      dockerfile: Dockerfile
+    volumes:
+      - ./playground:/app
+    ports:
+      - "8888:8888"
+    environment:
+      - NODE_ENV=development
+    restart: unless-stopped
 
 volumes:
   database-data:
