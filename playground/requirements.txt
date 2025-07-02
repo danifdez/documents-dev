@@ -3,4 +3,5 @@ torch
 llama-cpp-python
 sentence-transformers
 qdrant-client
+tiktoken
 jupyter
