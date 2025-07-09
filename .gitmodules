@@ -4,9 +4,6 @@
 [submodule "backend"]
 	path = backend
 	url = https://github.com/danifdez/documents-backend.git
-[submodule "jobs"]
-	path = jobs
-	url = https://github.com/danifdez/documents-jobs.git
-[submodule "rag"]
-    path = rag
-    url = https://github.com/danifdez/documents-rag.git
+[submodule "models"]
+	path = models
+	url = https://github.com/danifdez/documents-models.git
