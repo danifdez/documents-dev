@@ -90,6 +90,14 @@ Credentials: username `root`, password `example`.
 
 The `playground/` folder contains notebooks and scripts for experiments. It runs a Jupyter notebook server, allowing you to execute notebooks either via the web interface or by connecting a notebook client to the running server.
 
+To run the playground Jupyter service using Docker Compose:
+
+```bash
+docker-compose up playground
+```
+
+This will start the Jupyter notebook server in a container and expose it on port 8888. Access the web interface at http://localhost:8888.
+
 ### Document Storage
 
 Uploaded and processed documents are stored in the `documents/` folder, organized by resource/job IDs. Each subfolder contains normalized content and metadata.
