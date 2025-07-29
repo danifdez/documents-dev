@@ -85,7 +85,7 @@ services:
     profiles: ["local"]
     build:
       context: ./playground
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile
     volumes:
       - ./playground:/app
     ports:
@@ -93,6 +93,10 @@ services:
     environment:
       - NODE_ENV=development
     restart: unless-stopped
+    depends_on:
+      - database
+      - qdrant
+      - backend
 
 volumes:
   database-data:
