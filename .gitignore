@@ -3,3 +3,4 @@ playground/.ipynb_checkpoints
 playground/.Trash-1000
 playground/models
 **/__pycache__/**
+playground/*.ipynb
