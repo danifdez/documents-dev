@@ -10,6 +10,7 @@ services:
     environment:
       - WAYLAND_DISPLAY=${WAYLAND_DISPLAY}  # Pass Wayland display from the host
       - XDG_RUNTIME_DIR=/run/user/${UID}    # Set the runtime directory for Wayland
+      - ELECTRON_DISABLE_SECURITY_KEYRING=1
     cap_add:
       - SYS_ADMIN
     security_opt:
