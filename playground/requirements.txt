@@ -20,3 +20,5 @@ tiktoken
 jupyter
 jupyter_ai
 python-lsp-server[all]
+spacy
+networkx
