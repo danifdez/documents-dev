@@ -5,7 +5,7 @@ seaborn
 scikit-learn
 torch
 tensorflow
-pymongo
+psycopg[binary]
 qdrant-client
 transformers
 llama-cpp-python
@@ -22,3 +22,6 @@ jupyter_ai
 python-lsp-server[all]
 spacy
 networkx
+langchain
+langgraph
+pydantic

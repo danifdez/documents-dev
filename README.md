@@ -8,7 +8,7 @@ documents-dev is a monorepo for intelligent document processing and search, desi
 - **models/**: Python microservices for document extraction, language detection, summarization, translation, and vector search.
 - **frontend/**: An Electron + Vue desktop app for user interaction, built with Vite and Tailwind.
 
-The system supports multi-format document ingestion (PDF, DOC, TXT, HTML), automated extraction and normalization, language detection, semantic search, and real-time updates. Data flows between services using MongoDB for job/resource state, Qdrant for vector search, and WebSocket for notifications.
+The system supports multi-format document ingestion (PDF, DOC, TXT, HTML), automated extraction and normalization, language detection, semantic search, and real-time updates. Data flows between services using PostgreSQL for job/resource state, Qdrant for vector search, and WebSocket for notifications.
 
 All services can be run independently or together via Docker Compose for streamlined development and deployment.
 
@@ -46,7 +46,7 @@ To run the full end-to-end test suite, use the dedicated Docker Compose file:
 docker-compose -f docker-compose.e2e.yml up --build
 ```
 
-This will start isolated containers for MongoDB, Qdrant, backend, models, and frontend (in testing mode). The backend and frontend will wait for healthy dependencies before starting tests. All test results and logs will be available in the container output.
+This will start isolated containers for PostgreSQL, Qdrant, backend, models, and frontend (in testing mode). The backend and frontend will wait for healthy dependencies before starting tests. All test results and logs will be available in the container output.
 
 ## Getting Started
 
@@ -76,15 +76,15 @@ Qdrant runs on port 6333 (or 6334 for e2e). Use the [Qdrant REST API](https://qd
 curl http://localhost:6333/collections
 ```
 
-### Connecting to MongoDB
+### Connecting to PostgreSQL
 
-MongoDB runs on port 27017 (or 27018 for e2e). Use MongoDB Compass or the CLI:
+PostgreSQL runs on port 5432 (or 5433 for e2e). Use `psql` or any Postgres client:
 
 ```bash
-mongosh --host localhost --port 27017
+psql -h localhost -p 5432 -U postgres -d documents
 ```
 
-Credentials: username `root`, password `example`.
+Credentials: username `postgres`, password `example`.
 
 ### Using the Playground
 

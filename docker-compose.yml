@@ -60,15 +60,16 @@ services:
       - database
 
   database:
-    image: mongo:latest
+    image: postgres:17.6
     container_name: database
     ports:
-      - "27017:27017"
+      - "5432:5432"
     volumes:
-      - database-data:/data/db
+      - database-data:/var/lib/postgresql/data
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=root
-      - MONGO_INITDB_ROOT_PASSWORD=example
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=example
+      - POSTGRES_DB=documents
     restart: unless-stopped
 
   qdrant:
@@ -102,3 +103,4 @@ services:
 volumes:
   database-data:
   qdrant_data:
+  
