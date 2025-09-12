@@ -33,7 +33,7 @@ Additionally, the repository includes a **playground/** project for running expe
 To start all services together, use Docker Compose from the repository root:
 
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
 
 This will build and launch the backend, frontend, models, and playground containers. You can access the Electron app locally and interact with all features.
@@ -43,7 +43,7 @@ This will build and launch the backend, frontend, models, and playground contain
 To run the full end-to-end test suite, use the dedicated Docker Compose file:
 
 ```bash
-docker-compose -f docker-compose.e2e.yml up --build
+docker compose -f docker-compose.e2e.yml up --build
 ```
 
 This will start isolated containers for PostgreSQL, Qdrant, backend, models, and frontend (in testing mode). The backend and frontend will wait for healthy dependencies before starting tests. All test results and logs will be available in the container output.
@@ -59,13 +59,13 @@ Start the Electron app via Docker Compose or locally. To open DevTools, use `Ctr
 To view logs for any service, run:
 
 ```bash
-docker-compose logs <service-name>
+docker compose logs <service-name>
 ```
 
 For end-to-end tests:
 
 ```bash
-docker-compose -f docker-compose.e2e.yml logs <service-name>
+docker compose -f docker-compose.e2e.yml logs <service-name>
 ```
 
 ### Connecting to Qdrant
@@ -93,7 +93,7 @@ The `playground/` folder contains notebooks and scripts for experiments. It runs
 To run the playground Jupyter service using Docker Compose:
 
 ```bash
-docker-compose up playground
+docker compose up playground
 ```
 
 This will start the Jupyter notebook server in a container and expose it on port 8888. Access the web interface at http://localhost:8888.
