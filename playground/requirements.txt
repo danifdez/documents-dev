@@ -25,3 +25,4 @@ networkx
 langchain
 langgraph
 pydantic
+neo4j
