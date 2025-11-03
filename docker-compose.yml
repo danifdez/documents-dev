@@ -73,10 +73,6 @@ services:
     environment:
       - NODE_ENV=development
     restart: unless-stopped
-    depends_on:
-      - database
-      - qdrant
-      - backend
 
 volumes:
   database-data:
