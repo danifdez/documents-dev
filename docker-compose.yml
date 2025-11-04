@@ -29,6 +29,7 @@ services:
       - ./documents:/app/documents_storage
     environment:
       - NODE_ENV=development
+      - PYTHONUNBUFFERED=1
     env_file:
       - .env
     restart: unless-stopped
