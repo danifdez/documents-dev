@@ -102,6 +102,24 @@ This will start the Jupyter notebook server in a container and expose it on port
 
 Uploaded and processed documents are stored in the `documents/` folder, organized by resource/job IDs. Each subfolder contains normalized content and metadata.
 
+### Resetting the Project (Development)
+
+To reset the project to a clean state (local development only) run the repository-level reset script. This will:
+
+- Delete all files under `./documents`
+- Drop all tables in the `documents` Postgres database (keeps Postgres volume intact)
+- Remove all Qdrant collections
+- Delete the frontend config directory (`~/.config/documents-frontend`)
+- Re-run backend migrations and seeders
+
+Use with care; this operation is destructive. To run it:
+
+```bash
+bash ./reset-dev.sh --yes
+```
+
+The script requires Docker Compose to be available on the host.
+
 ### AI Model Storage
 
 Large language models and embeddings are stored in `models/models/` and `playground/models/`. These are used for extraction, summarization, and semantic search tasks.
