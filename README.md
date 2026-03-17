@@ -1,128 +1,160 @@
-# documents-dev
+# Documents dev — Development Environment
 
-## Overview
+Enterprise-scale intelligent document processing platform. Combines AI/LLM microservices with a desktop application for document management, extraction, analysis, and semantic search.
 
-documents-dev is a monorepo for intelligent document processing and search, designed for enterprise-scale workflows. It consists of three main services:
+Note: This repository and the Docker Compose orchestration configuration are intended for development environments only and to simplify running the services together. It is not required to use this composition to install the services; each service can be installed and deployed independently following its own instructions.
 
-- **backend/**: A NestJS API for job orchestration, resource management, and real-time notifications via WebSocket.
-- **models/**: Python microservices for document extraction, language detection, summarization, translation, and vector search.
-- **frontend/**: An Electron + Vue desktop app for user interaction, built with Vite and Tailwind.
+## Architecture
 
-The system supports multi-format document ingestion (PDF, DOC, TXT, HTML), automated extraction and normalization, language detection, semantic search, and real-time updates. Data flows between services using PostgreSQL for job/resource state, Qdrant for vector search, and WebSocket for notifications.
+The project is a monorepo with three main services as Git submodules, orchestrated with Docker Compose:
 
-All services can be run independently or together via Docker Compose for streamlined development and deployment.
+```
+documents-dev/
+├── backend/              # NestJS API service (Git submodule)
+├── frontend/             # Electron + Vue desktop app (Git submodule)
+├── models/               # Python AI/ML microservices (Git submodule)
+├── playground/           # Jupyter notebooks for experimentation
+├── documents/            # Processed document storage
+├── docker-compose.yml    # Development environment
+├── docker-compose.e2e.yml # End-to-end testing
+└── reset-dev.sh          # Development reset script
+```
 
-Additionally, the repository includes a **playground/** project for running experiments, prototyping, and testing document processing workflows in isolation.
+### Tech Stack
+
+| Service | Technologies |
+|---------|-------------|
+| **Backend** | NestJS, TypeORM, PostgreSQL 17.6, Socket.io |
+| **Frontend** | Electron, Vue 3, Vite, Tailwind CSS v4, TipTap |
+| **Models** | Python 3.11, Mistral-7B (llama-cpp), spaCy, sentence-transformers, Qdrant |
+| **Playground** | Python 3.12, Jupyter Notebook |
+
+### Data Flow
+
+Documents flow through a job queue in PostgreSQL. The backend orchestrates jobs and the models service processes them asynchronously. Embeddings are stored in Qdrant for semantic search, and real-time notifications are delivered via WebSocket.
 
 ## Features
 
-- Multi-format document ingestion: PDF, DOC, TXT, HTML
-- Automated extraction and normalization to HTML
-- Language detection and translation
-- Entity extraction and summarization
-- Semantic search with vector embeddings
-- Real-time notifications via WebSocket
-- Modular job orchestration and resource management
-- Extensible architecture for custom job types and processors
-- Experimentation and prototyping in playground/
+- **Multi-format ingestion**: PDF, DOC, DOCX, TXT, HTML
+- **Extraction and normalization** to HTML
+- **Automatic language detection**
+- **Multi-language translation**
+- **Summarization** with LLM (Mistral-7B)
+- **Named entity extraction** (NER with spaCy): persons, organizations, locations
+- **Semantic search** with vector embeddings (BAAI/bge-small-en-v1.5)
+- **RAG** (Retrieval-Augmented Generation): question answering over documents
+- **Keyword and key point extraction**
+- **Real-time notifications** via WebSocket
+- **Modular job orchestration** extensible with custom types and processors
 
 ## Installation
 
-### Run All Services
+### Prerequisites
 
-To start all services together, use Docker Compose from the repository root:
+- Docker and Docker Compose
+- Git (with submodule support)
+
+### Clone the Repository
+
+```bash
+git clone --recurse-submodules https://github.com/danifdez/documents-dev.git
+cd documents-dev
+```
+
+### Start All Services
 
 ```bash
 docker compose up --build
 ```
 
-This will build and launch the backend, frontend, models, and playground containers. You can access the Electron app locally and interact with all features.
+This builds and launches the backend, frontend, models, and dependencies (PostgreSQL, Qdrant).
 
-### Run End-to-End Tests
+### Ports
 
-To run the full end-to-end test suite, use the dedicated Docker Compose file:
+| Service | Port |
+|---------|------|
+| Backend API | 3000 |
+| Backend Debug | 9229 |
+| PostgreSQL | 5432 |
+| Qdrant | 6333 |
+| Playground (Jupyter) | 8888 |
 
-```bash
-docker compose -f docker-compose.e2e.yml up --build
-```
-
-This will start isolated containers for PostgreSQL, Qdrant, backend, models, and frontend (in testing mode). The backend and frontend will wait for healthy dependencies before starting tests. All test results and logs will be available in the container output.
-
-## Getting Started
+## Usage
 
 ### Electron App
 
-Start the Electron app via Docker Compose or locally. To open DevTools, use `Ctrl+Shift+I` (Windows/Linux) or `Cmd+Opt+I` (Mac) inside the app window.
+Start the app locally. To open DevTools: `Ctrl+Shift+I` (Windows/Linux) or `Cmd+Opt+I` (Mac).
 
-### Viewing Docker Logs
-
-To view logs for any service, run:
+### Service Logs
 
 ```bash
 docker compose logs <service-name>
 ```
 
-For end-to-end tests:
-
-```bash
-docker compose -f docker-compose.e2e.yml logs <service-name>
-```
-
-### Connecting to Qdrant
-
-Qdrant runs on port 6333 (or 6334 for e2e). Use the [Qdrant REST API](https://qdrant.tech/documentation/) or [Qdrant UI](https://github.com/qdrant/qdrant-ui) to inspect and query vectors:
-
-```bash
-curl http://localhost:6333/collections
-```
-
-### Connecting to PostgreSQL
-
-PostgreSQL runs on port 5432 (or 5433 for e2e). Use `psql` or any Postgres client:
+### Connect to PostgreSQL
 
 ```bash
 psql -h localhost -p 5432 -U postgres -d documents
 ```
 
-Credentials: username `postgres`, password `example`.
+Credentials: user `postgres`, password `example`.
 
-### Using the Playground
+### Connect to Qdrant
 
-The `playground/` folder contains notebooks and scripts for experiments. It runs a Jupyter notebook server, allowing you to execute notebooks either via the web interface or by connecting a notebook client to the running server.
+```bash
+curl http://localhost:6333/collections
+```
 
-To run the playground Jupyter service using Docker Compose:
+See the [Qdrant documentation](https://qdrant.tech/documentation/) for more details.
+
+### Document Storage
+
+Uploaded and processed documents are stored in `documents/`, organized by resource/job IDs. Each subfolder contains normalized content and metadata.
+
+### AI Models
+
+Language models and embeddings are stored in `models/models/` and `playground/models/`. Main configuration in `models/config.py`:
+
+- **LLM**: Mistral-7B-Instruct-v0.3 (quantized GGUF)
+- **Embeddings**: BAAI/bge-small-en-v1.5
+- **Context**: 32,768 tokens
+- **RAG**: 5 results, 1000 max tokens by default
+
+## Playground
+
+Experimentation environment with Jupyter for prototyping document processing workflows.
 
 ```bash
 docker compose up playground
 ```
 
-This will start the Jupyter notebook server in a container and expose it on port 8888. Access the web interface at http://localhost:8888.
+Access the web interface at http://localhost:8888.
 
-### Document Storage
+## Testing
 
-Uploaded and processed documents are stored in the `documents/` folder, organized by resource/job IDs. Each subfolder contains normalized content and metadata.
+### End-to-End Tests
 
-### Resetting the Project (Development)
+```bash
+docker compose -f docker-compose.e2e.yml up --build
+```
 
-To reset the project to a clean state (local development only) run the repository-level reset script. This will:
+Launches isolated containers with separate ports (PostgreSQL on 5433, Qdrant on 6334). Backend and frontend wait for healthy dependencies before running tests.
 
-- Delete all files under `./documents`
-- Drop all tables in the `documents` Postgres database (keeps Postgres volume intact)
-- Remove all Qdrant collections
-- Delete the frontend config directory (`~/.config/documents-frontend`)
-- Re-run backend migrations and seeders
+### E2E Test Logs
 
-Use with care; this operation is destructive. To run it:
+```bash
+docker compose -f docker-compose.e2e.yml logs <service-name>
+```
+
+## Development Reset
+
+To reset the project to a clean state (local development only):
 
 ```bash
 bash ./reset-dev.sh --yes
 ```
 
-The script requires Docker Compose to be available on the host.
-
-### AI Model Storage
-
-Large language models and embeddings are stored in `models/models/` and `playground/models/`. These are used for extraction, summarization, and semantic search tasks.
+This deletes documents, PostgreSQL tables, Qdrant collections, frontend config (`~/.config/documents-frontend`), and re-runs migrations and seeders. **Destructive operation**: use with care.
 
 ## License
 
