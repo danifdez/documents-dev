@@ -1,0 +1,950 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+# ── Colors ──────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+BOLD='\033[1m'
+DIM='\033[2m'
+
+info()  { printf "${CYAN}[INFO]${NC}  %s\n" "$*"; }
+ok()    { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
+warn()  { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
+fail()  { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; exit 1; }
+
+# ── Interactive prompt with default value ────────────────────────
+# Usage: ask "Variable description" "DEFAULT_VALUE"
+# Sets REPLY to the user's answer (or default if empty)
+ask() {
+  local prompt="$1" default="$2"
+  printf "  ${BOLD}%s${NC} ${DIM}[%s]${NC}: " "$prompt" "$default"
+  read -r REPLY
+  REPLY="${REPLY:-$default}"
+}
+
+# ── Interactive .env setup ───────────────────────────────────────
+setup_env_root() {
+  local ENV_FILE="$ROOT_DIR/.env"
+  if [ -f "$ENV_FILE" ]; then
+    ok ".env already exists (skipping)"
+    return
+  fi
+
+  echo ""
+  printf "${BOLD}${CYAN}── Root environment configuration ──${NC}\n"
+  printf "${DIM}  Press Enter to accept the default value shown in brackets.${NC}\n"
+  echo ""
+
+  ask "PostgreSQL host" "localhost";            local PG_HOST="$REPLY"
+  ask "PostgreSQL port" "5432";                 local PG_PORT="$REPLY"
+  ask "PostgreSQL database" "documents";        local PG_DB="$REPLY"
+  ask "PostgreSQL user" "postgres";             local PG_USER="$REPLY"
+  ask "PostgreSQL password" "example";          local PG_PASS="$REPLY"
+  ask "Enable authentication (true/false)" "false"; local AUTH="$REPLY"
+  ask "JWT secret" "change-me-in-production";   local JWT="$REPLY"
+  ask "Enable offline support (true/false)" "false"; local OFFLINE="$REPLY"
+  ask "Offline file size limit (bytes)" "10485760"; local OFFLINE_LIMIT="$REPLY"
+
+  cat > "$ENV_FILE" <<EOF
+# Database
+POSTGRES_HOST=$PG_HOST
+POSTGRES_PORT=$PG_PORT
+POSTGRES_DB=$PG_DB
+POSTGRES_USER=$PG_USER
+POSTGRES_PASSWORD=$PG_PASS
+
+# Authentication (set AUTH_ENABLED=true for multi-user mode)
+AUTH_ENABLED=$AUTH
+JWT_SECRET=$JWT
+
+# Offline support (set OFFLINE_ENABLED=true to allow clients to cache content)
+OFFLINE_ENABLED=$OFFLINE
+OFFLINE_FILE_SIZE_LIMIT=$OFFLINE_LIMIT
+EOF
+  ok "Created .env"
+
+  # Export shared values for child env setups
+  ENV_PG_HOST="$PG_HOST"
+  ENV_PG_PORT="$PG_PORT"
+  ENV_PG_DB="$PG_DB"
+  ENV_PG_USER="$PG_USER"
+  ENV_PG_PASS="$PG_PASS"
+  ENV_AUTH="$AUTH"
+  ENV_JWT="$JWT"
+  ENV_OFFLINE="$OFFLINE"
+  ENV_OFFLINE_LIMIT="$OFFLINE_LIMIT"
+}
+
+setup_env_backend() {
+  local ENV_FILE="$ROOT_DIR/backend/.env"
+  if [ -f "$ENV_FILE" ]; then
+    ok "backend/.env already exists (skipping)"
+    return
+  fi
+
+  # Use values from root setup if available, otherwise use defaults
+  local DEF_PG_HOST="${ENV_PG_HOST:-localhost}"
+  local DEF_PG_PORT="${ENV_PG_PORT:-5432}"
+  local DEF_PG_DB="${ENV_PG_DB:-documents}"
+  local DEF_PG_USER="${ENV_PG_USER:-postgres}"
+  local DEF_PG_PASS="${ENV_PG_PASS:-example}"
+  local DEF_AUTH="${ENV_AUTH:-false}"
+  local DEF_JWT="${ENV_JWT:-change-me-in-production}"
+  local DEF_OFFLINE="${ENV_OFFLINE:-false}"
+  local DEF_OFFLINE_LIMIT="${ENV_OFFLINE_LIMIT:-10485760}"
+
+  echo ""
+  printf "${BOLD}${CYAN}── Backend environment configuration ──${NC}\n"
+  printf "${DIM}  Values from root config are used as defaults where applicable.${NC}\n"
+  echo ""
+
+  ask "Backend server port" "3000";                   local PORT="$REPLY"
+  ask "CORS origin" "http://localhost:5173";           local CORS="$REPLY"
+  ask "Body size limit" "50mb";                        local BODY="$REPLY"
+  ask "Documents storage directory" "../documents";    local STORAGE="$REPLY"
+  ask "JWT access token expiry" "15m";                 local JWT_ACCESS="$REPLY"
+  ask "JWT refresh token expiry" "7d";                 local JWT_REFRESH="$REPLY"
+  ask "Default admin username" "admin";                local ADMIN_USER="$REPLY"
+  ask "Default admin password" "admin";                local ADMIN_PASS="$REPLY"
+
+  cat > "$ENV_FILE" <<EOF
+# Database
+POSTGRES_HOST=$DEF_PG_HOST
+POSTGRES_PORT=$DEF_PG_PORT
+POSTGRES_DB=$DEF_PG_DB
+POSTGRES_USER=$DEF_PG_USER
+POSTGRES_PASSWORD=$DEF_PG_PASS
+
+# Server
+PORT=$PORT
+CORS_ORIGIN=$CORS
+BODY_LIMIT=$BODY
+
+# File Storage
+DOCUMENTS_STORAGE_DIR=$STORAGE
+
+# Authentication (set AUTH_ENABLED=true for multi-user mode)
+AUTH_ENABLED=$DEF_AUTH
+JWT_SECRET=$DEF_JWT
+JWT_ACCESS_EXPIRY=$JWT_ACCESS
+JWT_REFRESH_EXPIRY=$JWT_REFRESH
+ADMIN_USERNAME=$ADMIN_USER
+ADMIN_PASSWORD=$ADMIN_PASS
+
+# Offline support (set OFFLINE_ENABLED=true to allow clients to cache content)
+OFFLINE_ENABLED=$DEF_OFFLINE
+OFFLINE_FILE_SIZE_LIMIT=$DEF_OFFLINE_LIMIT
+EOF
+  ok "Created backend/.env"
+}
+
+setup_env_models() {
+  local ENV_FILE="$ROOT_DIR/models/.env"
+  if [ -f "$ENV_FILE" ]; then
+    ok "models/.env already exists (skipping)"
+    return
+  fi
+
+  local DEF_PG_HOST="${ENV_PG_HOST:-localhost}"
+  local DEF_PG_PORT="${ENV_PG_PORT:-5432}"
+  local DEF_PG_DB="${ENV_PG_DB:-documents}"
+  local DEF_PG_USER="${ENV_PG_USER:-postgres}"
+  local DEF_PG_PASS="${ENV_PG_PASS:-example}"
+
+  echo ""
+  printf "${BOLD}${CYAN}── Models environment configuration ──${NC}\n"
+  printf "${DIM}  Database values inherited from root config. Configure worker settings.${NC}\n"
+  echo ""
+
+  ask "Qdrant host" "localhost";                      local QD_HOST="$REPLY"
+  ask "Qdrant port" "6333";                           local QD_PORT="$REPLY"
+  ask "Qdrant collection name" "rag_docs";            local QD_COLL="$REPLY"
+  ask "RAG default limit" "5";                        local RAG_LIM="$REPLY"
+  ask "RAG max tokens" "1000";                        local RAG_TOK="$REPLY"
+  ask "RAG score threshold" "0.35";                   local RAG_TH="$REPLY"
+  ask "RAG chunk target words" "150";                 local CH_TARGET="$REPLY"
+  ask "RAG chunk max words" "250";                    local CH_MAX="$REPLY"
+  ask "RAG chunk overlap words" "30";                 local CH_OVER="$REPLY"
+  ask "Heartbeat interval (seconds)" "15";            local HB="$REPLY"
+  ask "Disable LLM tasks (true/false)" "false";       local DIS_LLM="$REPLY"
+  ask "Disable embeddings tasks (true/false)" "false"; local DIS_EMB="$REPLY"
+  ask "Background hours start (0-23)" "2";            local BG_START="$REPLY"
+  ask "Background hours end (0-23)" "6";              local BG_END="$REPLY"
+  ask "Documents storage directory" "../documents";   local STORAGE="$REPLY"
+
+  cat > "$ENV_FILE" <<EOF
+# Database Configuration
+POSTGRES_HOST=$DEF_PG_HOST
+POSTGRES_PORT=$DEF_PG_PORT
+POSTGRES_DB=$DEF_PG_DB
+POSTGRES_USER=$DEF_PG_USER
+POSTGRES_PASSWORD=$DEF_PG_PASS
+JOBS_TABLE=jobs
+
+# Qdrant Configuration
+QDRANT_HOST=$QD_HOST
+QDRANT_PORT=$QD_PORT
+QDRANT_URL=http://$QD_HOST:$QD_PORT
+QDRANT_COLLECTION=$QD_COLL
+
+# RAG Configuration
+RAG_DEFAULT_LIMIT=$RAG_LIM
+RAG_MAX_TOKENS=$RAG_TOK
+RAG_SCORE_THRESHOLD=$RAG_TH
+
+# RAG Chunking Configuration
+RAG_CHUNK_TARGET_WORDS=$CH_TARGET
+RAG_CHUNK_MAX_WORDS=$CH_MAX
+RAG_CHUNK_OVERLAP_WORDS=$CH_OVER
+
+# Worker Identity Configuration
+WORKER_ID=
+WORKER_NAME=
+HEARTBEAT_INTERVAL=$HB
+
+# Worker Capabilities Configuration
+WORKER_DISABLE_LLM=$DIS_LLM
+WORKER_DISABLE_EMBEDDINGS=$DIS_EMB
+
+# Task Filtering Configuration
+WORKER_ENABLED_TASKS=
+WORKER_DISABLED_TASKS=
+
+# Background Processing Hours (24h format)
+BACKGROUND_HOURS_START=$BG_START
+BACKGROUND_HOURS_END=$BG_END
+
+# File Storage Configuration
+DOCUMENTS_STORAGE_DIR=$STORAGE
+EOF
+  ok "Created models/.env"
+}
+
+setup_env_frontend() {
+  local ENV_FILE="$ROOT_DIR/frontend/.env"
+  if [ -f "$ENV_FILE" ]; then
+    ok "frontend/.env already exists (skipping)"
+    return
+  fi
+
+  echo ""
+  printf "${BOLD}${CYAN}── Frontend environment configuration ──${NC}\n"
+  echo ""
+
+  ask "Backend API URL" "http://localhost:3000"; local API_URL="$REPLY"
+
+  cat > "$ENV_FILE" <<EOF
+VITE_API_URL=$API_URL
+EOF
+  ok "Created frontend/.env"
+}
+
+# ── Load .env if present (export vars for docker-compose and scripts) ──
+load_env() {
+  if [ -f "$ROOT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$ROOT_DIR/.env"
+    set +a
+  fi
+}
+
+PIDFILE="$ROOT_DIR/.pids"
+LOCKFILE="$ROOT_DIR/.manage.lock"
+LOG_DIR="$ROOT_DIR/.logs"
+MAX_LOG_BACKUPS=3
+MAX_LOG_SIZE=$((10 * 1024 * 1024))  # 10MB per log file
+LOG_CHECK_INTERVAL=60                # check every 60 seconds
+
+# ── Kill all processes matching a pattern (thorough cleanup) ──
+kill_by_pattern() {
+  local pattern="$1" label="${2:-process}"
+  local pids
+  pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+  if [ -n "$pids" ]; then
+    echo "$pids" | xargs -r kill 2>/dev/null || true
+    sleep 0.5
+    # Force kill any survivors
+    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+      echo "$pids" | xargs -r kill -9 2>/dev/null || true
+    fi
+    ok "Killed $label processes"
+    return 0
+  fi
+  return 1
+}
+
+# ── Kill process group started with setsid ──
+kill_process_group() {
+  local pid="$1"
+  if [ -z "$pid" ]; then return 1; fi
+  if ! kill -0 "$pid" 2>/dev/null; then return 1; fi
+  # Negative PID sends signal to entire process group
+  kill -- -"$pid" 2>/dev/null || true
+  sleep 0.5
+  kill -9 -- -"$pid" 2>/dev/null || true
+  return 0
+}
+
+# ── Guard: check if a service is already running ──
+is_service_running() {
+  local name="$1" pid_var="$2"
+  if [ -f "$PIDFILE" ]; then
+    source "$PIDFILE"
+    local pid="${!pid_var:-}"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 0  # running
+    fi
+  fi
+  # Also check by process pattern as fallback
+  case "$name" in
+    backend) pgrep -f "nest start" >/dev/null 2>&1 && return 0 ;;
+    models)  pgrep -f "python jobs.py" >/dev/null 2>&1 && return 0 ;;
+  esac
+  return 1  # not running
+}
+
+# ── Log rotation (copytruncate — safe while process is writing) ──
+rotate_log() {
+  local logfile="$1"
+  if [ ! -f "$logfile" ]; then return; fi
+  local size
+  size=$(stat -c%s "$logfile" 2>/dev/null || echo 0)
+  if [ "$size" -gt 0 ]; then
+    local base
+    base=$(basename "$logfile")
+    local ts
+    ts=$(date +%Y%m%d_%H%M%S)
+    # Copy then truncate — keeps the file descriptor valid for the running process
+    cp "$logfile" "${LOG_DIR}/${base}.${ts}"
+    : > "$logfile"
+    # Keep only the last N backups
+    ls -t "${LOG_DIR}/${base}."* 2>/dev/null | tail -n +$((MAX_LOG_BACKUPS + 1)) | xargs -r rm -f
+  fi
+}
+
+ensure_log_dir() {
+  mkdir -p "$LOG_DIR"
+}
+
+# ── Live log rotation watchdog (runs in background) ──
+start_log_watchdog() {
+  ensure_log_dir
+  (
+    while true; do
+      sleep "$LOG_CHECK_INTERVAL"
+      for logfile in "$ROOT_DIR"/.backend.log "$ROOT_DIR"/.models.log "$ROOT_DIR"/.playground.log; do
+        if [ -f "$logfile" ]; then
+          size=$(stat -c%s "$logfile" 2>/dev/null || echo 0)
+          if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
+            rotate_log "$logfile"
+          fi
+        fi
+      done
+    done
+  ) &
+  LOG_WATCHDOG_PID=$!
+}
+
+# ── Detect Docker Compose ──────────────────────────────────────────
+detect_compose() {
+  command -v docker >/dev/null 2>&1 || fail "Docker is not installed."
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+  elif docker-compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
+  else
+    fail "Docker Compose not found (requires 'docker compose' or 'docker-compose')."
+  fi
+}
+
+# ── Wait for PostgreSQL ────────────────────────────────────────────
+wait_for_postgres() {
+  local retries=${1:-30}
+  info "Waiting for PostgreSQL..."
+  until docker exec database pg_isready -U "${POSTGRES_USER:-postgres}" >/dev/null 2>&1; do
+    retries=$((retries - 1))
+    if [ "$retries" -le 0 ]; then
+      fail "PostgreSQL did not become ready in time."
+    fi
+    sleep 1
+  done
+  ok "PostgreSQL is ready"
+}
+
+# ── Ensure PostgreSQL extensions ───────────────────────────────────
+ensure_pg_extensions() {
+  info "Ensuring PostgreSQL extensions..."
+  docker exec database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent;" >/dev/null 2>&1
+  ok "PostgreSQL extensions ready (pg_trgm, unaccent)"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# INSTALL
+# ════════════════════════════════════════════════════════════════════
+cmd_install() {
+  detect_compose
+  load_env
+
+  if ! docker info >/dev/null 2>&1; then
+    fail "Docker daemon is not running. Start Docker and try again."
+  fi
+
+  ok "Docker and Docker Compose available"
+
+  # ── Interactive environment configuration ──
+  info "Configuring environment..."
+  setup_env_root
+  setup_env_backend
+  setup_env_models
+  setup_env_frontend
+
+  # Reload env so docker-compose and scripts use the configured values
+  load_env
+
+  # ── Create documents directory ──
+  mkdir -p "$ROOT_DIR/documents"
+  ok "documents/ directory ready"
+
+  # ── Start infrastructure (database + qdrant) ──
+  info "Starting database and qdrant containers..."
+  $COMPOSE_CMD up -d
+  wait_for_postgres 30
+  ensure_pg_extensions
+
+  # ── Install backend via its install script ──
+  info "Installing backend service..."
+  cd "$ROOT_DIR/backend"
+  bash install.sh
+  cd "$ROOT_DIR"
+
+  # ── Install models via its install script ──
+  info "Installing models service..."
+  cd "$ROOT_DIR/models"
+  bash install.sh
+  cd "$ROOT_DIR"
+
+  # ── Install frontend dependencies ──
+  info "Installing frontend dependencies..."
+  cd "$ROOT_DIR/frontend"
+  npm install
+  ok "Frontend dependencies installed"
+
+  # ── Install rpmbuild if missing (needed by electron-forge maker-rpm) ──
+  if ! command -v rpmbuild >/dev/null 2>&1; then
+    info "Installing rpmbuild (required for electron-forge RPM builds)..."
+    sudo apt-get update -qq && sudo apt-get install -y -qq rpm
+    ok "rpmbuild installed"
+  else
+    ok "rpmbuild already available"
+  fi
+  cd "$ROOT_DIR"
+
+  # ── Summary ──
+  echo ""
+  printf "${GREEN}============================================${NC}\n"
+  printf "${GREEN}  Installation complete!${NC}\n"
+  printf "${GREEN}============================================${NC}\n"
+  echo ""
+  echo "  Start all services:    bash manage.sh start"
+  echo "  Stop all services:     bash manage.sh stop"
+  echo ""
+  echo "  Or run individually:"
+  echo "    Infrastructure:      docker compose up -d"
+  echo "    Backend:             cd backend && npm run start:dev"
+  echo "    Models:              cd models && source .venv/bin/activate && python jobs.py"
+  echo "    Frontend:            cd frontend && npm start"
+  echo ""
+}
+
+# ════════════════════════════════════════════════════════════════════
+# START
+# ════════════════════════════════════════════════════════════════════
+cmd_start() {
+  detect_compose
+  load_env
+
+  # ── Check for already-running instances ──
+  local backend_already=0 models_already=0
+  if is_service_running backend BACKEND_PID; then
+    warn "Backend is already running. Skipping."
+    backend_already=1
+  fi
+  if is_service_running models MODELS_PID; then
+    warn "Models is already running. Skipping."
+    models_already=1
+  fi
+  if [ "$backend_already" -eq 1 ] && [ "$models_already" -eq 1 ]; then
+    warn "All services are already running. Use 'bash manage.sh stop' first to restart."
+    return 0
+  fi
+
+  # ── Start infrastructure ──
+  info "Starting database and qdrant..."
+  $COMPOSE_CMD up -d
+  wait_for_postgres 30
+  ensure_pg_extensions
+
+  # ── Rotate old logs and start watchdog ──
+  ensure_log_dir
+  rotate_log "$ROOT_DIR/.backend.log"
+  rotate_log "$ROOT_DIR/.models.log"
+  start_log_watchdog
+  ok "Log watchdog started (rotates at ${MAX_LOG_SIZE} bytes, checks every ${LOG_CHECK_INTERVAL}s)"
+
+  # ── Preserve existing PIDs from file ──
+  local EXISTING_BACKEND_PID="" EXISTING_MODELS_PID=""
+  if [ -f "$PIDFILE" ]; then
+    source "$PIDFILE"
+    EXISTING_BACKEND_PID="${BACKEND_PID:-}"
+    EXISTING_MODELS_PID="${MODELS_PID:-}"
+  fi
+
+  # ── Start backend (only if not already running) ──
+  if [ "$backend_already" -eq 0 ]; then
+    # Kill any orphan backend processes first
+    kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
+    kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
+    info "Starting backend..."
+    cd "$ROOT_DIR/backend"
+    setsid npm run start:dev > "$ROOT_DIR/.backend.log" 2>&1 &
+    BACKEND_PID=$!
+    cd "$ROOT_DIR"
+    ok "Backend started (PGID: $BACKEND_PID)"
+  else
+    BACKEND_PID="$EXISTING_BACKEND_PID"
+  fi
+
+  # ── Start models (only if not already running) ──
+  if [ "$models_already" -eq 0 ]; then
+    # Kill any orphan models processes first
+    kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
+    info "Starting models..."
+    cd "$ROOT_DIR/models"
+    source .venv/bin/activate
+    setsid python jobs.py > "$ROOT_DIR/.models.log" 2>&1 &
+    MODELS_PID=$!
+    deactivate
+    cd "$ROOT_DIR"
+    ok "Models started (PGID: $MODELS_PID)"
+  else
+    MODELS_PID="$EXISTING_MODELS_PID"
+  fi
+
+  # ── Save PIDs ──
+  echo "BACKEND_PID=$BACKEND_PID" > "$PIDFILE"
+  echo "MODELS_PID=$MODELS_PID" >> "$PIDFILE"
+  echo "LOG_WATCHDOG_PID=$LOG_WATCHDOG_PID" >> "$PIDFILE"
+
+  echo ""
+  printf "${GREEN}============================================${NC}\n"
+  printf "${GREEN}  All services are running!${NC}\n"
+  printf "${GREEN}============================================${NC}\n"
+  echo ""
+  echo "  Backend API:    http://localhost:3000  (PID: $BACKEND_PID)"
+  echo "  Models:         running                (PID: $MODELS_PID)"
+  echo "  PostgreSQL:     localhost:5432"
+  echo "  Qdrant:         http://localhost:6333"
+  echo ""
+  echo "  Logs:"
+  echo "    Backend:      tail -f .backend.log"
+  echo "    Models:       tail -f .models.log"
+  echo ""
+  echo "  Frontend (run separately):"
+  echo "    cd frontend && npm start"
+  echo ""
+  echo "  Stop:           bash manage.sh stop"
+  echo ""
+}
+
+# ════════════════════════════════════════════════════════════════════
+# STOP
+# ════════════════════════════════════════════════════════════════════
+cmd_stop() {
+  detect_compose
+
+  # ── Kill tracked process groups ──
+  if [ -f "$PIDFILE" ]; then
+    source "$PIDFILE"
+    if kill_process_group "${BACKEND_PID:-}"; then
+      ok "Backend process group stopped (PGID: ${BACKEND_PID})"
+    fi
+    if kill_process_group "${MODELS_PID:-}"; then
+      ok "Models process group stopped (PGID: ${MODELS_PID})"
+    fi
+    if [ -n "${LOG_WATCHDOG_PID:-}" ] && kill -0 "${LOG_WATCHDOG_PID}" 2>/dev/null; then
+      kill "${LOG_WATCHDOG_PID}" 2>/dev/null || true
+      ok "Log watchdog stopped"
+    fi
+    rm -f "$PIDFILE"
+  else
+    warn "No PID file found."
+  fi
+
+  # ── Always clean up any orphan processes by pattern ──
+  kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
+  kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
+  kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
+
+  # ── Kill anything still on port 3000 ──
+  local port_pid
+  port_pid=$(lsof -ti:3000 2>/dev/null || true)
+  if [ -n "$port_pid" ]; then
+    echo "$port_pid" | xargs -r kill -9 2>/dev/null || true
+    ok "Killed process(es) on port 3000"
+  fi
+
+  # ── Stop Docker containers ──
+  info "Stopping database and qdrant..."
+  $COMPOSE_CMD down
+  ok "Infrastructure stopped"
+
+  echo ""
+  ok "All services stopped"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# RESET
+# ════════════════════════════════════════════════════════════════════
+cmd_reset() {
+  local YES=0
+  for arg in "$@"; do
+    case "$arg" in
+      --yes) YES=1 ;;
+      *) ;;
+    esac
+  done
+
+  if [ "$YES" -ne 1 ]; then
+    echo "This will PERMANENTLY DELETE project data (documents, DB tables, Qdrant collections, frontend settings)."
+    read -p "Type RESET to continue: " confirm
+    if [ "$confirm" != "RESET" ]; then
+      echo "Aborted."
+      exit 1
+    fi
+  fi
+
+  detect_compose
+  load_env
+  echo "==> Reset started"
+
+  # ── Stop local services if running ──
+  cmd_stop 2>/dev/null || true
+
+  # ── Start infrastructure ──
+  echo "-- Starting database and qdrant containers"
+  $COMPOSE_CMD up -d
+  wait_for_postgres 30
+
+  # ── Drop database ──
+  echo "-- Dropping all tables"
+  docker exec database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+
+  # ── Remove document files ──
+  echo "-- Removing document files in ./documents"
+  if [ -d "$ROOT_DIR/documents" ]; then
+    rm -rf "$ROOT_DIR/documents"/* || true
+  fi
+
+  # ── Clear Qdrant ──
+  echo "-- Clearing all Qdrant collections"
+  if command -v curl >/dev/null 2>&1; then
+    collections_json="$(curl -sS http://localhost:6333/collections || echo '')"
+    if [ -n "$collections_json" ]; then
+      names=$(printf "%s" "$collections_json" | python3 -c 'import sys,json; r=json.load(sys.stdin); print("\n".join([c["name"] for c in r.get("collections",[])]))' 2>/dev/null || true)
+      if [ -n "$names" ]; then
+        while IFS= read -r name; do
+          [ -z "$name" ] && continue
+          echo "Deleting collection: $name"
+          curl -sS -X DELETE "http://localhost:6333/collections/$name" || true
+        done <<< "$names"
+      fi
+    fi
+  fi
+
+  # ── Remove frontend settings ──
+  echo "-- Removing frontend user settings"
+  CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/documents-frontend"
+  if [ -d "$CFG_DIR" ]; then
+    rm -rf "$CFG_DIR"
+  fi
+
+  # ── Run migrations ──
+  echo "-- Running migrations"
+  cd "$ROOT_DIR/backend"
+  npm run migration:run
+  cd "$ROOT_DIR"
+
+  echo "==> Reset completed successfully"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# PLAYGROUND START
+# ════════════════════════════════════════════════════════════════════
+cmd_playground_start() {
+  local PLAYGROUND_DIR="$ROOT_DIR/playground"
+
+  if [ ! -d "$PLAYGROUND_DIR" ]; then
+    fail "playground/ directory not found."
+  fi
+
+  # ── Create .venv if missing ──
+  cd "$PLAYGROUND_DIR"
+  if [ ! -d ".venv" ]; then
+    info "Creating Python virtual environment for playground..."
+    python3 -m venv .venv
+    ok "Created .venv at playground/.venv"
+
+    info "Installing playground dependencies (this may take a while)..."
+    source .venv/bin/activate
+    pip install --upgrade pip
+    pip install -r requirements.txt
+    deactivate
+    ok "Playground dependencies installed"
+  fi
+
+  # ── Start Jupyter ──
+  ensure_log_dir
+  rotate_log "$ROOT_DIR/.playground.log"
+  info "Starting Jupyter notebook..."
+  source .venv/bin/activate
+  jupyter notebook > "$ROOT_DIR/.playground.log" 2>&1 &
+  PLAYGROUND_PID=$!
+  deactivate
+  cd "$ROOT_DIR"
+
+  # ── Save PID ──
+  echo "PLAYGROUND_PID=$PLAYGROUND_PID" > "$ROOT_DIR/.playground.pid"
+
+  echo ""
+  printf "${GREEN}============================================${NC}\n"
+  printf "${GREEN}  Playground is running!${NC}\n"
+  printf "${GREEN}============================================${NC}\n"
+  echo ""
+  echo "  Jupyter:   http://localhost:8888  (PID: $PLAYGROUND_PID)"
+  echo "  Log:       tail -f .playground.log"
+  echo ""
+  echo "  Stop:      bash manage.sh playground:stop"
+  echo ""
+}
+
+# ════════════════════════════════════════════════════════════════════
+# PLAYGROUND STOP
+# ════════════════════════════════════════════════════════════════════
+cmd_playground_stop() {
+  local PGPIDFILE="$ROOT_DIR/.playground.pid"
+
+  if [ -f "$PGPIDFILE" ]; then
+    source "$PGPIDFILE"
+    if [ -n "${PLAYGROUND_PID:-}" ] && kill -0 "$PLAYGROUND_PID" 2>/dev/null; then
+      kill "$PLAYGROUND_PID" 2>/dev/null || true
+      ok "Playground stopped (PID: $PLAYGROUND_PID)"
+    else
+      warn "Playground process (PID: ${PLAYGROUND_PID:-?}) is not running."
+    fi
+    rm -f "$PGPIDFILE"
+  else
+    warn "No playground PID file found. Trying to find process..."
+    pkill -f "jupyter-notebook" 2>/dev/null && ok "Jupyter process killed" || warn "No jupyter process found."
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════════
+# LOGS
+# ════════════════════════════════════════════════════════════════════
+cmd_logs() {
+  local SERVICE="${1:-}"
+  local LOGFILE
+
+  case "$SERVICE" in
+    backend)    LOGFILE="$ROOT_DIR/.backend.log" ;;
+    models)     LOGFILE="$ROOT_DIR/.models.log" ;;
+    playground) LOGFILE="$ROOT_DIR/.playground.log" ;;
+    *)          fail "Usage: $0 logs <backend|models|playground>" ;;
+  esac
+
+  [ -f "$LOGFILE" ] || fail "Log file not found: $LOGFILE. Is the service running?"
+  tail -f "$LOGFILE"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# EXPORT
+# ════════════════════════════════════════════════════════════════════
+cmd_export() {
+  local OUTPUT_FILE="${1:-}"
+  local TIMESTAMP
+  TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+
+  if [ -z "$OUTPUT_FILE" ]; then
+    OUTPUT_FILE="$ROOT_DIR/backup_${TIMESTAMP}.tar.gz"
+  fi
+
+  case "$OUTPUT_FILE" in
+    /*) ;;
+    *) OUTPUT_FILE="$ROOT_DIR/$OUTPUT_FILE" ;;
+  esac
+
+  load_env
+  info "Starting export..."
+
+  TMPDIR="$(mktemp -d)"
+  trap 'rm -rf "$TMPDIR"' EXIT
+
+  # ── Dump PostgreSQL ──
+  info "Dumping PostgreSQL database..."
+  PGPASSWORD="${POSTGRES_PASSWORD:-example}" pg_dump -h localhost -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" --clean --if-exists > "$TMPDIR/database.sql"
+  ok "Database dump complete"
+
+  # ── Copy documents ──
+  if [ -d "$ROOT_DIR/documents" ] && [ "$(ls -A "$ROOT_DIR/documents" 2>/dev/null)" ]; then
+    info "Copying documents folder..."
+    cp -a "$ROOT_DIR/documents" "$TMPDIR/documents"
+    ok "Documents copied"
+  else
+    mkdir -p "$TMPDIR/documents"
+  fi
+
+  # ── Metadata ──
+  cat > "$TMPDIR/backup_metadata.json" <<METAEOF
+{
+  "created_at": "$(date -Iseconds)",
+  "hostname": "$(hostname)",
+  "user": "$(whoami)"
+}
+METAEOF
+
+  # ── Compress ──
+  info "Compressing backup..."
+  tar -czf "$OUTPUT_FILE" -C "$TMPDIR" database.sql documents backup_metadata.json
+
+  ok "Export complete: $OUTPUT_FILE ($(du -h "$OUTPUT_FILE" | cut -f1))"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# IMPORT
+# ════════════════════════════════════════════════════════════════════
+cmd_import() {
+  local INPUT_FILE="${1:-}"
+
+  if [ -z "$INPUT_FILE" ]; then
+    fail "Usage: $0 import <backup_file.tar.gz>"
+  fi
+
+  case "$INPUT_FILE" in
+    /*) ;;
+    *) INPUT_FILE="$(pwd)/$INPUT_FILE" ;;
+  esac
+
+  [ -f "$INPUT_FILE" ] || fail "File not found: $INPUT_FILE"
+
+  echo "This will REPLACE the current database and documents with the contents of:"
+  echo "  $INPUT_FILE"
+  read -p "Type IMPORT to continue: " confirm
+  if [ "$confirm" != "IMPORT" ]; then
+    echo "Aborted."
+    exit 1
+  fi
+
+  detect_compose
+  load_env
+  info "Starting import..."
+
+  TMPDIR="$(mktemp -d)"
+  trap 'rm -rf "$TMPDIR"' EXIT
+
+  info "Extracting backup..."
+  tar -xzf "$INPUT_FILE" -C "$TMPDIR"
+
+  [ -f "$TMPDIR/database.sql" ] || fail "Invalid backup: database.sql not found"
+  [ -d "$TMPDIR/documents" ]    || fail "Invalid backup: documents/ not found"
+
+  # ── Ensure infrastructure is running ──
+  $COMPOSE_CMD up -d
+  wait_for_postgres 30
+
+  # ── Stop local services ──
+  cmd_stop 2>/dev/null || true
+  $COMPOSE_CMD up -d
+
+  # ── Restore PostgreSQL ──
+  info "Restoring PostgreSQL database..."
+  docker exec database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+  docker exec -i database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" < "$TMPDIR/database.sql"
+  ok "Database restored"
+
+  # ── Restore documents ──
+  info "Restoring documents folder..."
+  rm -rf "$ROOT_DIR/documents"/* 2>/dev/null || true
+  if [ "$(ls -A "$TMPDIR/documents" 2>/dev/null)" ]; then
+    cp -a "$TMPDIR/documents"/. "$ROOT_DIR/documents/"
+  fi
+  ok "Documents restored"
+
+  ok "Import complete. Run 'bash manage.sh start' to start services."
+}
+
+# ════════════════════════════════════════════════════════════════════
+# HELP
+# ════════════════════════════════════════════════════════════════════
+show_help() {
+  cat <<EOF
+Usage: $0 <command> [options]
+
+Commands:
+  install                 Set up the development environment:
+                          - Start PostgreSQL + Qdrant (Docker)
+                          - Install backend deps + run migrations
+                          - Create Python .venv + install deps
+                          - Install frontend deps
+
+  start                   Start all services:
+                          - PostgreSQL + Qdrant (Docker)
+                          - Backend (local, npm run start:dev)
+                          - Models (local, python jobs.py in .venv)
+
+  stop                    Stop all services
+
+  reset [--yes]           Permanently delete all project data and re-initialize.
+                          --yes  Skip confirmation prompt
+
+  playground:start        Start the Jupyter playground (local .venv)
+
+  playground:stop         Stop the Jupyter playground
+
+  logs <service>          Tail logs for a service (backend, models, playground)
+
+  export [output_file]    Create a compressed backup of the database and documents.
+
+  import <backup_file>    Restore database and documents from a backup file.
+
+  help                    Show this help message.
+EOF
+}
+
+# ════════════════════════════════════════════════════════════════════
+# MAIN
+# ════════════════════════════════════════════════════════════════════
+COMMAND="${1:-help}"
+shift || true
+
+case "$COMMAND" in
+  install)            cmd_install "$@" ;;
+  start)              cmd_start "$@" ;;
+  stop)               cmd_stop "$@" ;;
+  reset)              cmd_reset "$@" ;;
+  playground:start)   cmd_playground_start "$@" ;;
+  playground:stop)    cmd_playground_stop "$@" ;;
+  logs)               cmd_logs "$@" ;;
+  export)             cmd_export "$@" ;;
+  import)             cmd_import "$@" ;;
+  help|--help|-h) show_help ;;
+  *) fail "Unknown command: $COMMAND. Run '$0 help' for usage." ;;
+esac
