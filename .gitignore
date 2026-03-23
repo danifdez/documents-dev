@@ -5,4 +5,8 @@ playground/models
 **/__pycache__/**
 playground/**
 .github/**
-.env
+/development/**
+models/venv/
+.backend.log
+.models.log
+.pids

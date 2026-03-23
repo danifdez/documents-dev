@@ -1,54 +1,15 @@
 services:
-  backend:
-    container_name: backend
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    volumes:
-      - ./backend:/app
-      - ./documents:/app/documents_storage:rw
-    ports:
-      - "3000:3000"
-      - "9229:9229"
-    environment:
-      - NODE_ENV=development
-    env_file:
-      - .env
-    restart: unless-stopped
-    user: "${UID}:${GID}"
-    depends_on:
-      - database
-
-  models:
-    container_name: models
-    build:
-      context: ./models
-      dockerfile: Dockerfile
-    volumes:
-      - ./models:/app
-      - ./documents:/app/documents_storage
-    environment:
-      - NODE_ENV=development
-      - PYTHONUNBUFFERED=1
-    env_file:
-      - .env
-    restart: unless-stopped
-    user: "${UID}:${GID}"
-    depends_on:
-      - qdrant
-      - database
-
   database:
     image: postgres:17.6
     container_name: database
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - database-data:/var/lib/postgresql/data
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=example
-      - POSTGRES_DB=documents
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-example}
+      - POSTGRES_DB=${POSTGRES_DB:-documents}
     restart: unless-stopped
 
   qdrant:
@@ -60,22 +21,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
-  
-  playground:
-    container_name: playground
-    profiles: ["local"]
-    build:
-      context: ./playground
-      dockerfile: docker/Dockerfile
-    volumes:
-      - ./playground:/app
-    ports:
-      - "8888:8888"
-    environment:
-      - NODE_ENV=development
-    restart: unless-stopped
 
 volumes:
   database-data:
   qdrant_data:
-  
