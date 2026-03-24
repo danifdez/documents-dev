@@ -10,3 +10,5 @@ models/venv/
 .backend.log
 .models.log
 .pids
+.env
+.logs/
