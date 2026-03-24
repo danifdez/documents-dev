@@ -47,10 +47,8 @@ setup_env_root() {
   ask "PostgreSQL database" "documents";        local PG_DB="$REPLY"
   ask "PostgreSQL user" "postgres";             local PG_USER="$REPLY"
   ask "PostgreSQL password" "example";          local PG_PASS="$REPLY"
-  ask "Enable authentication (true/false)" "false"; local AUTH="$REPLY"
-  ask "JWT secret" "change-me-in-production";   local JWT="$REPLY"
-  ask "Enable offline support (true/false)" "false"; local OFFLINE="$REPLY"
-  ask "Offline file size limit (bytes)" "10485760"; local OFFLINE_LIMIT="$REPLY"
+  ask "Qdrant host" "localhost";                local QD_HOST="$REPLY"
+  ask "Qdrant port" "6333";                     local QD_PORT="$REPLY"
 
   cat > "$ENV_FILE" <<EOF
 # Database
@@ -60,190 +58,11 @@ POSTGRES_DB=$PG_DB
 POSTGRES_USER=$PG_USER
 POSTGRES_PASSWORD=$PG_PASS
 
-# Authentication (set AUTH_ENABLED=true for multi-user mode)
-AUTH_ENABLED=$AUTH
-JWT_SECRET=$JWT
-
-# Offline support (set OFFLINE_ENABLED=true to allow clients to cache content)
-OFFLINE_ENABLED=$OFFLINE
-OFFLINE_FILE_SIZE_LIMIT=$OFFLINE_LIMIT
-EOF
-  ok "Created .env"
-
-  # Export shared values for child env setups
-  ENV_PG_HOST="$PG_HOST"
-  ENV_PG_PORT="$PG_PORT"
-  ENV_PG_DB="$PG_DB"
-  ENV_PG_USER="$PG_USER"
-  ENV_PG_PASS="$PG_PASS"
-  ENV_AUTH="$AUTH"
-  ENV_JWT="$JWT"
-  ENV_OFFLINE="$OFFLINE"
-  ENV_OFFLINE_LIMIT="$OFFLINE_LIMIT"
-}
-
-setup_env_backend() {
-  local ENV_FILE="$ROOT_DIR/backend/.env"
-  if [ -f "$ENV_FILE" ]; then
-    ok "backend/.env already exists (skipping)"
-    return
-  fi
-
-  # Use values from root setup if available, otherwise use defaults
-  local DEF_PG_HOST="${ENV_PG_HOST:-localhost}"
-  local DEF_PG_PORT="${ENV_PG_PORT:-5432}"
-  local DEF_PG_DB="${ENV_PG_DB:-documents}"
-  local DEF_PG_USER="${ENV_PG_USER:-postgres}"
-  local DEF_PG_PASS="${ENV_PG_PASS:-example}"
-  local DEF_AUTH="${ENV_AUTH:-false}"
-  local DEF_JWT="${ENV_JWT:-change-me-in-production}"
-  local DEF_OFFLINE="${ENV_OFFLINE:-false}"
-  local DEF_OFFLINE_LIMIT="${ENV_OFFLINE_LIMIT:-10485760}"
-
-  echo ""
-  printf "${BOLD}${CYAN}── Backend environment configuration ──${NC}\n"
-  printf "${DIM}  Values from root config are used as defaults where applicable.${NC}\n"
-  echo ""
-
-  ask "Backend server port" "3000";                   local PORT="$REPLY"
-  ask "CORS origin" "http://localhost:5173";           local CORS="$REPLY"
-  ask "Body size limit" "50mb";                        local BODY="$REPLY"
-  ask "Documents storage directory" "../documents";    local STORAGE="$REPLY"
-  ask "JWT access token expiry" "15m";                 local JWT_ACCESS="$REPLY"
-  ask "JWT refresh token expiry" "7d";                 local JWT_REFRESH="$REPLY"
-  ask "Default admin username" "admin";                local ADMIN_USER="$REPLY"
-  ask "Default admin password" "admin";                local ADMIN_PASS="$REPLY"
-
-  cat > "$ENV_FILE" <<EOF
-# Database
-POSTGRES_HOST=$DEF_PG_HOST
-POSTGRES_PORT=$DEF_PG_PORT
-POSTGRES_DB=$DEF_PG_DB
-POSTGRES_USER=$DEF_PG_USER
-POSTGRES_PASSWORD=$DEF_PG_PASS
-
-# Server
-PORT=$PORT
-CORS_ORIGIN=$CORS
-BODY_LIMIT=$BODY
-
-# File Storage
-DOCUMENTS_STORAGE_DIR=$STORAGE
-
-# Authentication (set AUTH_ENABLED=true for multi-user mode)
-AUTH_ENABLED=$DEF_AUTH
-JWT_SECRET=$DEF_JWT
-JWT_ACCESS_EXPIRY=$JWT_ACCESS
-JWT_REFRESH_EXPIRY=$JWT_REFRESH
-ADMIN_USERNAME=$ADMIN_USER
-ADMIN_PASSWORD=$ADMIN_PASS
-
-# Offline support (set OFFLINE_ENABLED=true to allow clients to cache content)
-OFFLINE_ENABLED=$DEF_OFFLINE
-OFFLINE_FILE_SIZE_LIMIT=$DEF_OFFLINE_LIMIT
-EOF
-  ok "Created backend/.env"
-}
-
-setup_env_models() {
-  local ENV_FILE="$ROOT_DIR/models/.env"
-  if [ -f "$ENV_FILE" ]; then
-    ok "models/.env already exists (skipping)"
-    return
-  fi
-
-  local DEF_PG_HOST="${ENV_PG_HOST:-localhost}"
-  local DEF_PG_PORT="${ENV_PG_PORT:-5432}"
-  local DEF_PG_DB="${ENV_PG_DB:-documents}"
-  local DEF_PG_USER="${ENV_PG_USER:-postgres}"
-  local DEF_PG_PASS="${ENV_PG_PASS:-example}"
-
-  echo ""
-  printf "${BOLD}${CYAN}── Models environment configuration ──${NC}\n"
-  printf "${DIM}  Database values inherited from root config. Configure worker settings.${NC}\n"
-  echo ""
-
-  ask "Qdrant host" "localhost";                      local QD_HOST="$REPLY"
-  ask "Qdrant port" "6333";                           local QD_PORT="$REPLY"
-  ask "Qdrant collection name" "rag_docs";            local QD_COLL="$REPLY"
-  ask "RAG default limit" "5";                        local RAG_LIM="$REPLY"
-  ask "RAG max tokens" "1000";                        local RAG_TOK="$REPLY"
-  ask "RAG score threshold" "0.35";                   local RAG_TH="$REPLY"
-  ask "RAG chunk target words" "150";                 local CH_TARGET="$REPLY"
-  ask "RAG chunk max words" "250";                    local CH_MAX="$REPLY"
-  ask "RAG chunk overlap words" "30";                 local CH_OVER="$REPLY"
-  ask "Heartbeat interval (seconds)" "15";            local HB="$REPLY"
-  ask "Disable LLM tasks (true/false)" "false";       local DIS_LLM="$REPLY"
-  ask "Disable embeddings tasks (true/false)" "false"; local DIS_EMB="$REPLY"
-  ask "Background hours start (0-23)" "2";            local BG_START="$REPLY"
-  ask "Background hours end (0-23)" "6";              local BG_END="$REPLY"
-  ask "Documents storage directory" "../documents";   local STORAGE="$REPLY"
-
-  cat > "$ENV_FILE" <<EOF
-# Database Configuration
-POSTGRES_HOST=$DEF_PG_HOST
-POSTGRES_PORT=$DEF_PG_PORT
-POSTGRES_DB=$DEF_PG_DB
-POSTGRES_USER=$DEF_PG_USER
-POSTGRES_PASSWORD=$DEF_PG_PASS
-JOBS_TABLE=jobs
-
-# Qdrant Configuration
+# Qdrant
 QDRANT_HOST=$QD_HOST
 QDRANT_PORT=$QD_PORT
-QDRANT_URL=http://$QD_HOST:$QD_PORT
-QDRANT_COLLECTION=$QD_COLL
-
-# RAG Configuration
-RAG_DEFAULT_LIMIT=$RAG_LIM
-RAG_MAX_TOKENS=$RAG_TOK
-RAG_SCORE_THRESHOLD=$RAG_TH
-
-# RAG Chunking Configuration
-RAG_CHUNK_TARGET_WORDS=$CH_TARGET
-RAG_CHUNK_MAX_WORDS=$CH_MAX
-RAG_CHUNK_OVERLAP_WORDS=$CH_OVER
-
-# Worker Identity Configuration
-WORKER_ID=
-WORKER_NAME=
-HEARTBEAT_INTERVAL=$HB
-
-# Worker Capabilities Configuration
-WORKER_DISABLE_LLM=$DIS_LLM
-WORKER_DISABLE_EMBEDDINGS=$DIS_EMB
-
-# Task Filtering Configuration
-WORKER_ENABLED_TASKS=
-WORKER_DISABLED_TASKS=
-
-# Background Processing Hours (24h format)
-BACKGROUND_HOURS_START=$BG_START
-BACKGROUND_HOURS_END=$BG_END
-
-# File Storage Configuration
-DOCUMENTS_STORAGE_DIR=$STORAGE
 EOF
-  ok "Created models/.env"
-}
-
-setup_env_frontend() {
-  local ENV_FILE="$ROOT_DIR/frontend/.env"
-  if [ -f "$ENV_FILE" ]; then
-    ok "frontend/.env already exists (skipping)"
-    return
-  fi
-
-  echo ""
-  printf "${BOLD}${CYAN}── Frontend environment configuration ──${NC}\n"
-  echo ""
-
-  ask "Backend API URL" "http://localhost:3000"; local API_URL="$REPLY"
-
-  cat > "$ENV_FILE" <<EOF
-VITE_API_URL=$API_URL
-EOF
-  ok "Created frontend/.env"
+  ok "Created .env"
 }
 
 # ── Load .env if present (export vars for docker-compose and scripts) ──
@@ -400,12 +219,14 @@ cmd_install() {
 
   ok "Docker and Docker Compose available"
 
-  # ── Interactive environment configuration ──
-  info "Configuring environment..."
+  # ── Initialize and update git submodules ──
+  info "Downloading submodules..."
+  git submodule update --init --recursive
+  ok "Submodules ready"
+
+  # ── Interactive root environment configuration ──
+  info "Configuring root environment..."
   setup_env_root
-  setup_env_backend
-  setup_env_models
-  setup_env_frontend
 
   # Reload env so docker-compose and scripts use the configured values
   load_env
@@ -420,32 +241,20 @@ cmd_install() {
   wait_for_postgres 30
   ensure_pg_extensions
 
-  # ── Install backend via its install script ──
+  # ── Install each submodule (each handles its own .env + deps) ──
   info "Installing backend service..."
   cd "$ROOT_DIR/backend"
-  bash install.sh
+  bash install
   cd "$ROOT_DIR"
 
-  # ── Install models via its install script ──
   info "Installing models service..."
   cd "$ROOT_DIR/models"
-  bash install.sh
+  bash install
   cd "$ROOT_DIR"
 
-  # ── Install frontend dependencies ──
-  info "Installing frontend dependencies..."
+  info "Installing frontend..."
   cd "$ROOT_DIR/frontend"
-  npm install
-  ok "Frontend dependencies installed"
-
-  # ── Install rpmbuild if missing (needed by electron-forge maker-rpm) ──
-  if ! command -v rpmbuild >/dev/null 2>&1; then
-    info "Installing rpmbuild (required for electron-forge RPM builds)..."
-    sudo apt-get update -qq && sudo apt-get install -y -qq rpm
-    ok "rpmbuild installed"
-  else
-    ok "rpmbuild already available"
-  fi
+  bash install
   cd "$ROOT_DIR"
 
   # ── Summary ──
@@ -900,10 +709,10 @@ Usage: $0 <command> [options]
 
 Commands:
   install                 Set up the development environment:
+                          - Download git submodules
+                          - Configure root .env (database + qdrant)
                           - Start PostgreSQL + Qdrant (Docker)
-                          - Install backend deps + run migrations
-                          - Create Python .venv + install deps
-                          - Install frontend deps
+                          - Run each submodule's install.sh
 
   start                   Start all services:
                           - PostgreSQL + Qdrant (Docker)
