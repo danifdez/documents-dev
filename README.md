@@ -1,6 +1,6 @@
 # Documents Dev
 
-Development monorepo for the **Documents** platform — an intelligent document processing application that combines AI/LLM microservices with a desktop application for document management, extraction, analysis, and semantic search.
+Development monorepo for the **Documents** platform — an intelligent document processing application that combines AI/LLM microservices with a desktop application for document management, extraction, transcription, analysis, and semantic search.
 
 > **Note:** This repository is intended for development environments only. Each service is an independent Git submodule with its own repository and documentation. It is not required to use this orchestration; each service can be installed and run independently.
 
@@ -10,7 +10,7 @@ Development monorepo for the **Documents** platform — an intelligent document 
 |---------|-------------|-------------|
 | **Backend** | REST API and job orchestration | NestJS, TypeORM, PostgreSQL, Socket.io |
 | **Frontend** | Desktop application | Electron, Vue 3, Vite, Tailwind CSS |
-| **Models** | AI/ML processing workers | Python, Mistral-7B, spaCy, Qdrant |
+| **Models** | AI/ML processing workers | Python, Whisper, Mistral-7B, spaCy, Qdrant |
 
 ## Quick Start
 
