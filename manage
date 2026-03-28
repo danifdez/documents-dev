@@ -47,8 +47,13 @@ setup_env_root() {
   ask "PostgreSQL database" "documents";        local PG_DB="$REPLY"
   ask "PostgreSQL user" "postgres";             local PG_USER="$REPLY"
   ask "PostgreSQL password" "example";          local PG_PASS="$REPLY"
-  ask "Qdrant host" "localhost";                local QD_HOST="$REPLY"
-  ask "Qdrant port" "6333";                     local QD_PORT="$REPLY"
+  ask "Enable AI / RAG feature (true/false)" "true"; local RAG_ENABLED="$REPLY"
+
+  local QD_HOST="localhost" QD_PORT="6333"
+  if [ "$RAG_ENABLED" != "false" ]; then
+    ask "Qdrant host" "localhost";                QD_HOST="$REPLY"
+    ask "Qdrant port" "6333";                     QD_PORT="$REPLY"
+  fi
 
   cat > "$ENV_FILE" <<EOF
 # Database
@@ -72,6 +77,27 @@ load_env() {
     # shellcheck disable=SC1091
     source "$ROOT_DIR/.env"
     set +a
+  fi
+}
+
+# ── Check if RAG feature is enabled ──────────────────────────
+is_rag_enabled() {
+  local backend_env="$ROOT_DIR/backend/.env"
+  if [ -f "$backend_env" ]; then
+    local val
+    val=$(grep -E '^FEATURE_RAG=' "$backend_env" 2>/dev/null | cut -d= -f2)
+    [ "$val" != "false" ]
+  else
+    return 0  # Default: enabled
+  fi
+}
+
+# Returns the docker compose services to start
+get_compose_services() {
+  if is_rag_enabled; then
+    echo ""  # empty = all services
+  else
+    echo "database"
   fi
 }
 
@@ -235,9 +261,9 @@ cmd_install() {
   mkdir -p "$ROOT_DIR/documents"
   ok "documents/ directory ready"
 
-  # ── Start infrastructure (database + qdrant) ──
-  info "Starting database and qdrant containers..."
-  $COMPOSE_CMD up -d
+  # ── Start infrastructure (database + conditionally qdrant) ──
+  info "Starting infrastructure containers..."
+  $COMPOSE_CMD up -d database
   wait_for_postgres 30
   ensure_pg_extensions
 
@@ -246,6 +272,15 @@ cmd_install() {
   cd "$ROOT_DIR/backend"
   bash install
   cd "$ROOT_DIR"
+
+  # Start Qdrant only if RAG is enabled (checked after backend .env is created)
+  if is_rag_enabled; then
+    info "RAG enabled – starting Qdrant..."
+    $COMPOSE_CMD up -d qdrant
+    ok "Qdrant started"
+  else
+    info "RAG disabled – skipping Qdrant"
+  fi
 
   info "Installing models service..."
   cd "$ROOT_DIR/models"
@@ -297,8 +332,13 @@ cmd_start() {
   fi
 
   # ── Start infrastructure ──
-  info "Starting database and qdrant..."
-  $COMPOSE_CMD up -d
+  if is_rag_enabled; then
+    info "Starting database and qdrant..."
+    $COMPOSE_CMD up -d
+  else
+    info "Starting database (RAG disabled, skipping qdrant)..."
+    $COMPOSE_CMD up -d database
+  fi
   wait_for_postgres 30
   ensure_pg_extensions
 
@@ -361,7 +401,9 @@ cmd_start() {
   echo "  Backend API:    http://localhost:3000  (PID: $BACKEND_PID)"
   echo "  Models:         running                (PID: $MODELS_PID)"
   echo "  PostgreSQL:     localhost:5432"
-  echo "  Qdrant:         http://localhost:6333"
+  if is_rag_enabled; then
+    echo "  Qdrant:         http://localhost:6333"
+  fi
   echo ""
   echo "  Logs:"
   echo "    Backend:      tail -f .backend.log"
