@@ -45,6 +45,7 @@ See [docs/scripts.md](docs/scripts.md) for all available commands.
 - [Docker Compose](docs/docker-compose.md) — Development and E2E compose files
 - [Playground](docs/playground.md) — Jupyter experimentation environment
 - [Scripts](docs/scripts.md) — `manage` script reference
+- [Standalone Mode](docs/standalone.md) — Local server build for distribution
 
 ## License
 
