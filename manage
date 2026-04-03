@@ -532,6 +532,10 @@ cmd_reset() {
   echo "-- Running migrations"
   cd "$ROOT_DIR/backend"
   npm run migration:run
+
+  # ── Install features ──
+  echo "-- Installing features"
+  npm run feature:install
   cd "$ROOT_DIR"
 
   echo "==> Reset completed successfully"
