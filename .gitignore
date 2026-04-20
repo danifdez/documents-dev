@@ -1,4 +1,6 @@
 documents/**
+documents-archive/**
+.profiles/
 playground/.ipynb_checkpoints
 playground/.Trash-1000
 playground/models
