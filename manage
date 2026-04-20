@@ -101,6 +101,179 @@ get_compose_services() {
   fi
 }
 
+# ── Data profiles (versioned DB + documents) ────────────────────────
+PROFILES_DIR="$ROOT_DIR/.profiles"
+
+get_active_profile() {
+  if [ -f "$PROFILES_DIR/.active" ]; then
+    tr -d '[:space:]' < "$PROFILES_DIR/.active"
+  else
+    echo "default"
+  fi
+}
+
+# Build the COMPOSE_PROJECT_NAME for a given profile
+profile_project_name() {
+  echo "documents-dev-$1"
+}
+
+# Build a Docker volume name for a given profile + volume suffix
+profile_volume_name() {
+  echo "documents-dev-$1_$2"
+}
+
+# Export COMPOSE_PROJECT_NAME so every `docker compose` call is namespaced by profile
+export_compose_project() {
+  export COMPOSE_PROJECT_NAME="$(profile_project_name "$(get_active_profile)")"
+}
+
+profile_exists() {
+  [ -d "$PROFILES_DIR/$1" ] && [ -f "$PROFILES_DIR/$1/metadata.json" ]
+}
+
+profile_archive_exists() {
+  [ -f "$PROFILES_DIR/archived/$1.tar.gz" ]
+}
+
+validate_profile_name() {
+  local name="$1"
+  if [ -z "$name" ]; then
+    fail "Profile name is required."
+  fi
+  if ! [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+    fail "Invalid profile name '$name' (allowed: letters, digits, '-', '_'; must not start with '-' or '_')."
+  fi
+}
+
+# Copy one Docker volume into another (creates destination if missing).
+# Args: <src_volume> <dst_volume>
+clone_docker_volume() {
+  local src="$1" dst="$2"
+  if ! docker volume inspect "$src" >/dev/null 2>&1; then
+    return 0
+  fi
+  docker volume create "$dst" >/dev/null
+  docker run --rm \
+    -v "${src}:/from:ro" \
+    -v "${dst}:/to" \
+    alpine sh -c 'cd /from && (tar cf - . | (cd /to && tar xf -))' >/dev/null
+}
+
+# Human-readable size of a Docker volume (or "-" if absent)
+volume_size_human() {
+  local vol="$1"
+  if ! docker volume inspect "$vol" >/dev/null 2>&1; then
+    echo "-"
+    return
+  fi
+  docker run --rm -v "${vol}:/v:ro" alpine sh -c 'du -sh /v 2>/dev/null | cut -f1' 2>/dev/null || echo "?"
+}
+
+# Ensure the documents/ entry is a symlink to the active profile's folder
+refresh_documents_symlink() {
+  local profile="$1"
+  local target_rel=".profiles/${profile}/documents"
+  local target_abs="$PROFILES_DIR/${profile}/documents"
+  mkdir -p "$target_abs"
+
+  if [ -L "$ROOT_DIR/documents" ]; then
+    rm -f "$ROOT_DIR/documents"
+  elif [ -d "$ROOT_DIR/documents" ]; then
+    if [ -z "$(ls -A "$ROOT_DIR/documents" 2>/dev/null || true)" ]; then
+      rmdir "$ROOT_DIR/documents"
+    else
+      fail "documents/ exists as a real directory with content. Move it into .profiles/<profile>/documents/ manually before continuing."
+    fi
+  fi
+  ln -s "$target_rel" "$ROOT_DIR/documents"
+
+  # Symmetric symlink for the archive folder (cold storage for archived resources)
+  local archive_target_rel=".profiles/${profile}/documents-archive"
+  local archive_target_abs="$PROFILES_DIR/${profile}/documents-archive"
+  mkdir -p "$archive_target_abs"
+
+  if [ -L "$ROOT_DIR/documents-archive" ]; then
+    rm -f "$ROOT_DIR/documents-archive"
+  elif [ -d "$ROOT_DIR/documents-archive" ]; then
+    if [ -z "$(ls -A "$ROOT_DIR/documents-archive" 2>/dev/null || true)" ]; then
+      rmdir "$ROOT_DIR/documents-archive"
+    else
+      fail "documents-archive/ exists as a real directory with content. Move it into .profiles/<profile>/documents-archive/ manually before continuing."
+    fi
+  fi
+  ln -s "$archive_target_rel" "$ROOT_DIR/documents-archive"
+}
+
+# Returns 0 if DOCUMENTS_ARCHIVE_DIR points inside the profile (default), 1 if it's external.
+# When external, the manage profile commands won't include archived files in the bundle.
+archive_dir_is_in_profile() {
+  local profile="$1"
+  if [ -z "${DOCUMENTS_ARCHIVE_DIR:-}" ]; then
+    return 0
+  fi
+  local in_profile_abs configured_abs
+  in_profile_abs="$(cd "$PROFILES_DIR/${profile}" 2>/dev/null && pwd)/documents-archive"
+  configured_abs="$(realpath -m "$DOCUMENTS_ARCHIVE_DIR" 2>/dev/null || echo "$DOCUMENTS_ARCHIVE_DIR")"
+  [ "$in_profile_abs" = "$configured_abs" ]
+}
+
+# Migrate pre-profile state (legacy volumes + plain documents/ dir) into a 'default' profile.
+# Idempotent; no-op once .profiles/.active exists.
+ensure_profiles_initialized() {
+  if [ -f "$PROFILES_DIR/.active" ]; then
+    return 0
+  fi
+
+  info "Initializing data profile system..."
+  mkdir -p "$PROFILES_DIR/default" "$PROFILES_DIR/default/documents-archive" "$PROFILES_DIR/archived"
+
+  # Move any existing documents into the default profile
+  if [ -d "$ROOT_DIR/documents" ] && [ ! -L "$ROOT_DIR/documents" ]; then
+    mkdir -p "$PROFILES_DIR/default/documents"
+    if [ -n "$(ls -A "$ROOT_DIR/documents" 2>/dev/null || true)" ]; then
+      info "  Moving existing documents/ into .profiles/default/documents/"
+      (cd "$ROOT_DIR/documents" && tar cf - .) | (cd "$PROFILES_DIR/default/documents" && tar xf -)
+      rm -rf "$ROOT_DIR/documents"/*
+      find "$ROOT_DIR/documents" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+    fi
+    rmdir "$ROOT_DIR/documents" 2>/dev/null || rm -rf "$ROOT_DIR/documents"
+  fi
+
+  # Stop any containers left from the pre-profile layout (container_name: database/qdrant/neo4j)
+  for c in database qdrant neo4j; do
+    if docker ps -a --format '{{.Names}}' | grep -qx "$c"; then
+      info "  Removing legacy container: $c"
+      docker rm -f "$c" >/dev/null 2>&1 || true
+    fi
+  done
+
+  # Rename legacy volumes (documents-dev_*) to the new profile-scoped names
+  for suffix in database-data qdrant_data neo4j_data; do
+    local legacy="documents-dev_${suffix}"
+    local target="$(profile_volume_name default "$suffix")"
+    if docker volume inspect "$legacy" >/dev/null 2>&1 && ! docker volume inspect "$target" >/dev/null 2>&1; then
+      info "  Migrating volume: $legacy -> $target"
+      clone_docker_volume "$legacy" "$target"
+      docker volume rm "$legacy" >/dev/null 2>&1 || warn "Could not remove legacy volume $legacy"
+    fi
+  done
+
+  # Write metadata for default profile
+  cat > "$PROFILES_DIR/default/metadata.json" <<METAEOF
+{
+  "name": "default",
+  "created_at": "$(date -Iseconds)",
+  "description": "Initial profile (auto-created during profile system init)"
+}
+METAEOF
+
+  # Recreate documents/ as a symlink
+  refresh_documents_symlink default
+
+  echo "default" > "$PROFILES_DIR/.active"
+  ok "Profile system ready. Active profile: default"
+}
+
 PIDFILE="$ROOT_DIR/.pids"
 LOCKFILE="$ROOT_DIR/.manage.lock"
 LOG_DIR="$ROOT_DIR/.logs"
@@ -215,7 +388,7 @@ detect_compose() {
 wait_for_postgres() {
   local retries=${1:-30}
   info "Waiting for PostgreSQL..."
-  until docker exec database pg_isready -U "${POSTGRES_USER:-postgres}" >/dev/null 2>&1; do
+  until $COMPOSE_CMD exec -T database pg_isready -U "${POSTGRES_USER:-postgres}" >/dev/null 2>&1; do
     retries=$((retries - 1))
     if [ "$retries" -le 0 ]; then
       fail "PostgreSQL did not become ready in time."
@@ -228,7 +401,7 @@ wait_for_postgres() {
 # ── Ensure PostgreSQL extensions ───────────────────────────────────
 ensure_pg_extensions() {
   info "Ensuring PostgreSQL extensions..."
-  docker exec database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent;" >/dev/null 2>&1
+  $COMPOSE_CMD exec -T database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent;" >/dev/null 2>&1
   ok "PostgreSQL extensions ready (pg_trgm, unaccent)"
 }
 
@@ -257,9 +430,10 @@ cmd_install() {
   # Reload env so docker-compose and scripts use the configured values
   load_env
 
-  # ── Create documents directory ──
-  mkdir -p "$ROOT_DIR/documents"
-  ok "documents/ directory ready"
+  # ── Initialize profile system (default profile + documents symlink) ──
+  ensure_profiles_initialized
+  export_compose_project
+  ok "documents/ symlink points to profile: $(get_active_profile)"
 
   # ── Start infrastructure (database + conditionally qdrant) ──
   info "Starting infrastructure containers..."
@@ -312,11 +486,179 @@ cmd_install() {
 # ════════════════════════════════════════════════════════════════════
 # START
 # ════════════════════════════════════════════════════════════════════
+save_pidfile() {
+  echo "BACKEND_PID=${BACKEND_PID:-}" > "$PIDFILE"
+  echo "MODELS_PID=${MODELS_PID:-}" >> "$PIDFILE"
+  echo "LOG_WATCHDOG_PID=${LOG_WATCHDOG_PID:-}" >> "$PIDFILE"
+}
+
+source_pidfile() {
+  BACKEND_PID="" ; MODELS_PID="" ; LOG_WATCHDOG_PID=""
+  [ -f "$PIDFILE" ] && source "$PIDFILE"
+}
+
+ensure_log_watchdog() {
+  source_pidfile
+  if [ -n "${LOG_WATCHDOG_PID:-}" ] && kill -0 "${LOG_WATCHDOG_PID}" 2>/dev/null; then
+    return 0
+  fi
+  ensure_log_dir
+  start_log_watchdog
+  save_pidfile
+  ok "Log watchdog started (rotates at ${MAX_LOG_SIZE} bytes, checks every ${LOG_CHECK_INTERVAL}s)"
+}
+
+start_backend() {
+  source_pidfile
+  if is_service_running backend BACKEND_PID; then
+    warn "Backend is already running. Skipping."
+    return 0
+  fi
+  ensure_log_dir
+  rotate_log "$ROOT_DIR/.backend.log"
+  kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
+  kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
+  info "Starting backend..."
+  cd "$ROOT_DIR/backend"
+  setsid npm run start:dev > "$ROOT_DIR/.backend.log" 2>&1 &
+  BACKEND_PID=$!
+  cd "$ROOT_DIR"
+  ok "Backend started (PGID: $BACKEND_PID)"
+  save_pidfile
+}
+
+start_models() {
+  source_pidfile
+  if is_service_running models MODELS_PID; then
+    warn "Models is already running. Skipping."
+    return 0
+  fi
+  ensure_log_dir
+  rotate_log "$ROOT_DIR/.models.log"
+  kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
+  info "Starting models..."
+  cd "$ROOT_DIR/models"
+  source .venv/bin/activate
+  setsid python jobs.py > "$ROOT_DIR/.models.log" 2>&1 &
+  MODELS_PID=$!
+  deactivate
+  cd "$ROOT_DIR"
+  ok "Models started (PGID: $MODELS_PID)"
+  save_pidfile
+}
+
+start_docker_service() {
+  local svc="$1"
+  detect_compose
+  info "Starting docker service: $svc..."
+  $COMPOSE_CMD up -d "$svc"
+  if [ "$svc" = "database" ]; then
+    wait_for_postgres 30
+    ensure_pg_extensions
+  fi
+}
+
+stop_backend() {
+  source_pidfile
+  if [ -n "${BACKEND_PID:-}" ] && kill_process_group "${BACKEND_PID}"; then
+    ok "Backend process group stopped (PGID: ${BACKEND_PID})"
+  fi
+  BACKEND_PID=""
+  save_pidfile
+  kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
+  kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
+  local port_pid
+  port_pid=$(lsof -ti:3000 2>/dev/null || true)
+  if [ -n "$port_pid" ]; then
+    echo "$port_pid" | xargs -r kill -9 2>/dev/null || true
+    ok "Killed process(es) on port 3000"
+  fi
+}
+
+stop_models() {
+  source_pidfile
+  if [ -n "${MODELS_PID:-}" ] && kill_process_group "${MODELS_PID}"; then
+    ok "Models process group stopped (PGID: ${MODELS_PID})"
+  fi
+  MODELS_PID=""
+  save_pidfile
+  kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
+}
+
+stop_docker_service() {
+  local svc="$1"
+  detect_compose
+  info "Stopping docker service: $svc..."
+  $COMPOSE_CMD stop "$svc"
+}
+
+is_known_component() {
+  case "$1" in
+    backend|models|database|qdrant|neo4j) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+print_start_summary() {
+  source_pidfile
+  echo ""
+  printf "${GREEN}============================================${NC}\n"
+  printf "${GREEN}  Services are running!${NC}\n"
+  printf "${GREEN}============================================${NC}\n"
+  echo ""
+  if [ -n "${BACKEND_PID:-}" ]; then
+    echo "  Backend API:    http://localhost:3000  (PID: $BACKEND_PID)"
+  fi
+  if [ -n "${MODELS_PID:-}" ]; then
+    echo "  Models:         running                (PID: $MODELS_PID)"
+  fi
+  echo "  PostgreSQL:     localhost:5432"
+  if is_rag_enabled; then
+    echo "  Qdrant:         http://localhost:6333"
+  fi
+  echo ""
+  echo "  Logs:"
+  echo "    Backend:      tail -f .backend.log"
+  echo "    Models:       tail -f .models.log"
+  echo ""
+  echo "  Stop:           ./manage stop"
+  echo ""
+}
+
 cmd_start() {
   detect_compose
   load_env
+  ensure_profiles_initialized
+  export_compose_project
+  info "Active profile: $(get_active_profile)"
 
-  # ── Check for already-running instances ──
+  # Per-component start
+  if [ $# -gt 0 ]; then
+    for component in "$@"; do
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, database, qdrant, neo4j)"
+    done
+    for component in "$@"; do
+      case "$component" in
+        backend)
+          start_docker_service database
+          if is_rag_enabled; then start_docker_service qdrant; fi
+          ensure_log_watchdog
+          start_backend
+          ;;
+        models)
+          ensure_log_watchdog
+          start_models
+          ;;
+        database|qdrant|neo4j)
+          start_docker_service "$component"
+          ;;
+      esac
+    done
+    print_start_summary
+    return 0
+  fi
+
+  # ── Full start (no args): existing behaviour ──
   local backend_already=0 models_already=0
   if is_service_running backend BACKEND_PID; then
     warn "Backend is already running. Skipping."
@@ -327,11 +669,10 @@ cmd_start() {
     models_already=1
   fi
   if [ "$backend_already" -eq 1 ] && [ "$models_already" -eq 1 ]; then
-    warn "All services are already running. Use 'bash manage.sh stop' first to restart."
+    warn "All services are already running. Use './manage stop' first to restart."
     return 0
   fi
 
-  # ── Start infrastructure ──
   if is_rag_enabled; then
     info "Starting database and qdrant..."
     $COMPOSE_CMD up -d
@@ -342,78 +683,12 @@ cmd_start() {
   wait_for_postgres 30
   ensure_pg_extensions
 
-  # ── Rotate old logs and start watchdog ──
-  ensure_log_dir
-  rotate_log "$ROOT_DIR/.backend.log"
-  rotate_log "$ROOT_DIR/.models.log"
-  start_log_watchdog
-  ok "Log watchdog started (rotates at ${MAX_LOG_SIZE} bytes, checks every ${LOG_CHECK_INTERVAL}s)"
+  ensure_log_watchdog
 
-  # ── Preserve existing PIDs from file ──
-  local EXISTING_BACKEND_PID="" EXISTING_MODELS_PID=""
-  if [ -f "$PIDFILE" ]; then
-    source "$PIDFILE"
-    EXISTING_BACKEND_PID="${BACKEND_PID:-}"
-    EXISTING_MODELS_PID="${MODELS_PID:-}"
-  fi
+  if [ "$backend_already" -eq 0 ]; then start_backend; fi
+  if [ "$models_already" -eq 0 ]; then start_models; fi
 
-  # ── Start backend (only if not already running) ──
-  if [ "$backend_already" -eq 0 ]; then
-    # Kill any orphan backend processes first
-    kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
-    kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
-    info "Starting backend..."
-    cd "$ROOT_DIR/backend"
-    setsid npm run start:dev > "$ROOT_DIR/.backend.log" 2>&1 &
-    BACKEND_PID=$!
-    cd "$ROOT_DIR"
-    ok "Backend started (PGID: $BACKEND_PID)"
-  else
-    BACKEND_PID="$EXISTING_BACKEND_PID"
-  fi
-
-  # ── Start models (only if not already running) ──
-  if [ "$models_already" -eq 0 ]; then
-    # Kill any orphan models processes first
-    kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
-    info "Starting models..."
-    cd "$ROOT_DIR/models"
-    source .venv/bin/activate
-    setsid python jobs.py > "$ROOT_DIR/.models.log" 2>&1 &
-    MODELS_PID=$!
-    deactivate
-    cd "$ROOT_DIR"
-    ok "Models started (PGID: $MODELS_PID)"
-  else
-    MODELS_PID="$EXISTING_MODELS_PID"
-  fi
-
-  # ── Save PIDs ──
-  echo "BACKEND_PID=$BACKEND_PID" > "$PIDFILE"
-  echo "MODELS_PID=$MODELS_PID" >> "$PIDFILE"
-  echo "LOG_WATCHDOG_PID=$LOG_WATCHDOG_PID" >> "$PIDFILE"
-
-  echo ""
-  printf "${GREEN}============================================${NC}\n"
-  printf "${GREEN}  All services are running!${NC}\n"
-  printf "${GREEN}============================================${NC}\n"
-  echo ""
-  echo "  Backend API:    http://localhost:3000  (PID: $BACKEND_PID)"
-  echo "  Models:         running                (PID: $MODELS_PID)"
-  echo "  PostgreSQL:     localhost:5432"
-  if is_rag_enabled; then
-    echo "  Qdrant:         http://localhost:6333"
-  fi
-  echo ""
-  echo "  Logs:"
-  echo "    Backend:      tail -f .backend.log"
-  echo "    Models:       tail -f .models.log"
-  echo ""
-  echo "  Frontend (run separately):"
-  echo "    cd frontend && npm start"
-  echo ""
-  echo "  Stop:           bash manage.sh stop"
-  echo ""
+  print_start_summary
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -421,8 +696,28 @@ cmd_start() {
 # ════════════════════════════════════════════════════════════════════
 cmd_stop() {
   detect_compose
+  load_env
+  ensure_profiles_initialized
+  export_compose_project
 
-  # ── Kill tracked process groups ──
+  # Per-component stop (don't tear down docker infra unless explicitly named)
+  if [ $# -gt 0 ]; then
+    for component in "$@"; do
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, database, qdrant, neo4j)"
+    done
+    for component in "$@"; do
+      case "$component" in
+        backend) stop_backend ;;
+        models)  stop_models ;;
+        database|qdrant|neo4j) stop_docker_service "$component" ;;
+      esac
+    done
+    echo ""
+    ok "Requested services stopped"
+    return 0
+  fi
+
+  # ── Full stop (no args): existing behaviour ──
   if [ -f "$PIDFILE" ]; then
     source "$PIDFILE"
     if kill_process_group "${BACKEND_PID:-}"; then
@@ -440,12 +735,10 @@ cmd_stop() {
     warn "No PID file found."
   fi
 
-  # ── Always clean up any orphan processes by pattern ──
   kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
   kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
   kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
 
-  # ── Kill anything still on port 3000 ──
   local port_pid
   port_pid=$(lsof -ti:3000 2>/dev/null || true)
   if [ -n "$port_pid" ]; then
@@ -453,7 +746,6 @@ cmd_stop() {
     ok "Killed process(es) on port 3000"
   fi
 
-  # ── Stop Docker containers ──
   info "Stopping database and qdrant..."
   $COMPOSE_CMD down
   ok "Infrastructure stopped"
@@ -485,7 +777,9 @@ cmd_reset() {
 
   detect_compose
   load_env
-  echo "==> Reset started"
+  ensure_profiles_initialized
+  export_compose_project
+  echo "==> Reset started (profile: $(get_active_profile))"
 
   # ── Stop local services if running ──
   cmd_stop 2>/dev/null || true
@@ -497,12 +791,24 @@ cmd_reset() {
 
   # ── Drop database ──
   echo "-- Dropping all tables"
-  docker exec database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+  $COMPOSE_CMD exec -T database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
 
-  # ── Remove document files ──
-  echo "-- Removing document files in ./documents"
-  if [ -d "$ROOT_DIR/documents" ]; then
-    rm -rf "$ROOT_DIR/documents"/* || true
+  # ── Remove document files (of the active profile) ──
+  local docs_target="$PROFILES_DIR/$(get_active_profile)/documents"
+  echo "-- Removing document files in $docs_target"
+  if [ -d "$docs_target" ]; then
+    rm -rf "$docs_target"/* 2>/dev/null || true
+    find "$docs_target" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+  fi
+
+  local archive_target="$PROFILES_DIR/$(get_active_profile)/documents-archive"
+  echo "-- Removing archived document files in $archive_target"
+  if [ -d "$archive_target" ]; then
+    rm -rf "$archive_target"/* 2>/dev/null || true
+    find "$archive_target" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+  fi
+  if ! archive_dir_is_in_profile "$(get_active_profile)"; then
+    warn "DOCUMENTS_ARCHIVE_DIR is set to an external path; files at '$DOCUMENTS_ARCHIVE_DIR' were NOT removed."
   fi
 
   # ── Clear Qdrant ──
@@ -648,7 +954,9 @@ cmd_export() {
   esac
 
   load_env
-  info "Starting export..."
+  ensure_profiles_initialized
+  export_compose_project
+  info "Starting export (profile: $(get_active_profile))..."
 
   TMPDIR="$(mktemp -d)"
   trap 'rm -rf "$TMPDIR"' EXIT
@@ -658,13 +966,24 @@ cmd_export() {
   PGPASSWORD="${POSTGRES_PASSWORD:-example}" pg_dump -h localhost -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" --clean --if-exists > "$TMPDIR/database.sql"
   ok "Database dump complete"
 
-  # ── Copy documents ──
-  if [ -d "$ROOT_DIR/documents" ] && [ "$(ls -A "$ROOT_DIR/documents" 2>/dev/null)" ]; then
+  # ── Copy documents (dereference the symlink to grab real files) ──
+  if [ -e "$ROOT_DIR/documents" ] && [ "$(ls -A "$ROOT_DIR/documents" 2>/dev/null)" ]; then
     info "Copying documents folder..."
-    cp -a "$ROOT_DIR/documents" "$TMPDIR/documents"
+    mkdir -p "$TMPDIR/documents"
+    (cd "$ROOT_DIR/documents" && tar cf - .) | (cd "$TMPDIR/documents" && tar xf -)
     ok "Documents copied"
   else
     mkdir -p "$TMPDIR/documents"
+  fi
+
+  # ── Copy archived documents ──
+  mkdir -p "$TMPDIR/documents-archive"
+  if archive_dir_is_in_profile "$(get_active_profile)" && [ -e "$ROOT_DIR/documents-archive" ] && [ "$(ls -A "$ROOT_DIR/documents-archive" 2>/dev/null)" ]; then
+    info "Copying archived documents folder..."
+    (cd "$ROOT_DIR/documents-archive" && tar cf - .) | (cd "$TMPDIR/documents-archive" && tar xf -)
+    ok "Archived documents copied"
+  elif ! archive_dir_is_in_profile "$(get_active_profile)"; then
+    warn "DOCUMENTS_ARCHIVE_DIR is set to an external path; archived files are NOT included in the export."
   fi
 
   # ── Metadata ──
@@ -678,7 +997,7 @@ METAEOF
 
   # ── Compress ──
   info "Compressing backup..."
-  tar -czf "$OUTPUT_FILE" -C "$TMPDIR" database.sql documents backup_metadata.json
+  tar -czf "$OUTPUT_FILE" -C "$TMPDIR" database.sql documents documents-archive backup_metadata.json
 
   ok "Export complete: $OUTPUT_FILE ($(du -h "$OUTPUT_FILE" | cut -f1))"
 }
@@ -710,7 +1029,9 @@ cmd_import() {
 
   detect_compose
   load_env
-  info "Starting import..."
+  ensure_profiles_initialized
+  export_compose_project
+  info "Starting import into profile: $(get_active_profile)"
 
   TMPDIR="$(mktemp -d)"
   trap 'rm -rf "$TMPDIR"' EXIT
@@ -731,19 +1052,430 @@ cmd_import() {
 
   # ── Restore PostgreSQL ──
   info "Restoring PostgreSQL database..."
-  docker exec database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
-  docker exec -i database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" < "$TMPDIR/database.sql"
+  $COMPOSE_CMD exec -T database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+  $COMPOSE_CMD exec -T database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" < "$TMPDIR/database.sql"
   ok "Database restored"
 
-  # ── Restore documents ──
+  # ── Restore documents (into the active profile's real directory) ──
   info "Restoring documents folder..."
-  rm -rf "$ROOT_DIR/documents"/* 2>/dev/null || true
+  local docs_target="$PROFILES_DIR/$(get_active_profile)/documents"
+  mkdir -p "$docs_target"
+  rm -rf "$docs_target"/* 2>/dev/null || true
+  find "$docs_target" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
   if [ "$(ls -A "$TMPDIR/documents" 2>/dev/null)" ]; then
-    cp -a "$TMPDIR/documents"/. "$ROOT_DIR/documents/"
+    (cd "$TMPDIR/documents" && tar cf - .) | (cd "$docs_target" && tar xf -)
   fi
   ok "Documents restored"
 
+  # ── Restore archived documents (skip silently if backup has none or archive dir is external) ──
+  if [ -d "$TMPDIR/documents-archive" ] && [ "$(ls -A "$TMPDIR/documents-archive" 2>/dev/null)" ]; then
+    if archive_dir_is_in_profile "$(get_active_profile)"; then
+      info "Restoring archived documents folder..."
+      local archive_target="$PROFILES_DIR/$(get_active_profile)/documents-archive"
+      mkdir -p "$archive_target"
+      rm -rf "$archive_target"/* 2>/dev/null || true
+      find "$archive_target" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+      (cd "$TMPDIR/documents-archive" && tar cf - .) | (cd "$archive_target" && tar xf -)
+      ok "Archived documents restored"
+    else
+      warn "Backup contains archived documents but DOCUMENTS_ARCHIVE_DIR is external; skipping. Move them manually if needed."
+    fi
+  fi
+
   ok "Import complete. Run 'bash manage.sh start' to start services."
+}
+
+# ════════════════════════════════════════════════════════════════════
+# PROFILE COMMANDS
+# ════════════════════════════════════════════════════════════════════
+
+# Internal: dump a single volume's contents into TMPDIR as <suffix>.tar
+_dump_volume_to_tar() {
+  local vol="$1" out_tar="$2"
+  docker run --rm \
+    -v "${vol}:/from:ro" \
+    -v "$(dirname "$out_tar"):/out" \
+    alpine sh -c "tar cf /out/$(basename "$out_tar") -C /from . 2>/dev/null" >/dev/null
+}
+
+# Internal: load a tar back into a (possibly new) volume
+_load_tar_into_volume() {
+  local in_tar="$1" vol="$2"
+  docker volume create "$vol" >/dev/null
+  docker run --rm \
+    -v "${vol}:/to" \
+    -v "$(dirname "$in_tar"):/in:ro" \
+    alpine sh -c "tar xf /in/$(basename "$in_tar") -C /to" >/dev/null
+}
+
+# Internal: check whether services are running (by port/pid)
+_services_are_running() {
+  if [ -f "$PIDFILE" ]; then
+    # shellcheck disable=SC1091
+    source "$PIDFILE"
+    if [ -n "${BACKEND_PID:-}" ] && kill -0 "${BACKEND_PID}" 2>/dev/null; then return 0; fi
+    if [ -n "${MODELS_PID:-}" ] && kill -0 "${MODELS_PID}" 2>/dev/null; then return 0; fi
+  fi
+  pgrep -f "nest start" >/dev/null 2>&1 && return 0
+  pgrep -f "python jobs.py" >/dev/null 2>&1 && return 0
+  # Any container with our current project name?
+  if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
+    if docker ps --format '{{.Names}}' | grep -q "^${COMPOSE_PROJECT_NAME}-"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+cmd_profile_list() {
+  detect_compose
+  ensure_profiles_initialized
+  local active
+  active="$(get_active_profile)"
+
+  printf "${BOLD}Profiles${NC}\n"
+  printf "  %-2s %-20s %-10s %-10s %-10s %s\n" "" "NAME" "POSTGRES" "QDRANT" "NEO4J" "CREATED"
+  printf "  %-2s %-20s %-10s %-10s %-10s %s\n" "" "----" "--------" "------" "-----" "-------"
+  local p name created pg qd neo mark
+  for p in "$PROFILES_DIR"/*/; do
+    [ -d "$p" ] || continue
+    name="$(basename "$p")"
+    [ "$name" = "archived" ] && continue
+    [ -f "$p/metadata.json" ] || continue
+    created="$(grep -oE '"created_at"[[:space:]]*:[[:space:]]*"[^"]+"' "$p/metadata.json" | head -1 | cut -d'"' -f4 || echo "?")"
+    pg="$(volume_size_human "$(profile_volume_name "$name" database-data)")"
+    qd="$(volume_size_human "$(profile_volume_name "$name" qdrant_data)")"
+    neo="$(volume_size_human "$(profile_volume_name "$name" neo4j_data)")"
+    mark=" "
+    [ "$name" = "$active" ] && mark="*"
+    printf "  ${GREEN}%-2s${NC} %-20s %-10s %-10s %-10s %s\n" "$mark" "$name" "$pg" "$qd" "$neo" "$created"
+  done
+
+  # Archived profiles
+  if [ -d "$PROFILES_DIR/archived" ]; then
+    local any=0
+    for a in "$PROFILES_DIR"/archived/*.tar.gz; do
+      [ -f "$a" ] || continue
+      if [ "$any" -eq 0 ]; then
+        echo ""
+        printf "${BOLD}Archived${NC}\n"
+        printf "  %-20s %-10s %s\n" "NAME" "SIZE" "FILE"
+        any=1
+      fi
+      local n sz
+      n="$(basename "$a" .tar.gz)"
+      sz="$(du -h "$a" 2>/dev/null | cut -f1)"
+      printf "  %-20s %-10s %s\n" "$n" "$sz" "$a"
+    done
+  fi
+}
+
+cmd_profile_current() {
+  ensure_profiles_initialized
+  get_active_profile
+}
+
+cmd_profile_create() {
+  local name="" src="" mode="empty"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)  src="$2"; mode="from"; shift 2 ;;
+      --empty) mode="empty"; shift ;;
+      -*)      fail "Unknown flag: $1" ;;
+      *)       [ -z "$name" ] && name="$1" || fail "Unexpected argument: $1"; shift ;;
+    esac
+  done
+
+  validate_profile_name "$name"
+  detect_compose
+  ensure_profiles_initialized
+
+  profile_exists "$name"       && fail "Profile '$name' already exists."
+  profile_archive_exists "$name" && fail "An archived profile named '$name' exists. Choose a different name or restore it first."
+
+  if [ "$mode" = "from" ]; then
+    [ "$src" = "current" ] && src="$(get_active_profile)"
+    profile_exists "$src" || fail "Source profile '$src' does not exist."
+    if [ "$src" = "$(get_active_profile)" ] && _services_are_running; then
+      fail "Source '$src' is the active profile and services are running. Stop them first with './manage stop'."
+    fi
+  fi
+
+  info "Creating profile '$name' (mode: $mode${src:+, from: $src})..."
+  mkdir -p "$PROFILES_DIR/$name/documents" "$PROFILES_DIR/$name/documents-archive"
+
+  if [ "$mode" = "from" ]; then
+    # Clone documents
+    info "  Cloning documents..."
+    if [ -d "$PROFILES_DIR/$src/documents" ] && [ -n "$(ls -A "$PROFILES_DIR/$src/documents" 2>/dev/null || true)" ]; then
+      (cd "$PROFILES_DIR/$src/documents" && tar cf - .) | (cd "$PROFILES_DIR/$name/documents" && tar xf -)
+    fi
+    # Clone archived documents (in-profile cold storage). Skip if user has overridden DOCUMENTS_ARCHIVE_DIR to an external path.
+    if archive_dir_is_in_profile "$src" && [ -d "$PROFILES_DIR/$src/documents-archive" ] && [ -n "$(ls -A "$PROFILES_DIR/$src/documents-archive" 2>/dev/null || true)" ]; then
+      info "  Cloning archived documents..."
+      (cd "$PROFILES_DIR/$src/documents-archive" && tar cf - .) | (cd "$PROFILES_DIR/$name/documents-archive" && tar xf -)
+    elif ! archive_dir_is_in_profile "$src"; then
+      warn "  DOCUMENTS_ARCHIVE_DIR is set to an external path; archived files for '$src' are NOT cloned."
+    fi
+    # Clone volumes
+    for suffix in database-data qdrant_data neo4j_data; do
+      local src_vol dst_vol
+      src_vol="$(profile_volume_name "$src" "$suffix")"
+      dst_vol="$(profile_volume_name "$name" "$suffix")"
+      if docker volume inspect "$src_vol" >/dev/null 2>&1; then
+        info "  Cloning volume: $src_vol -> $dst_vol"
+        clone_docker_volume "$src_vol" "$dst_vol"
+      fi
+    done
+  fi
+
+  cat > "$PROFILES_DIR/$name/metadata.json" <<METAEOF
+{
+  "name": "$name",
+  "created_at": "$(date -Iseconds)",
+  "description": "${mode} profile${src:+ cloned from $src}"
+}
+METAEOF
+
+  ok "Profile '$name' created."
+  if [ "$mode" = "empty" ]; then
+    echo ""
+    echo "  Next steps:"
+    echo "    ./manage profile:switch $name"
+    echo "    ./manage start"
+    echo "    (cd backend && npm run migration:run && npm run feature:install)"
+  else
+    echo ""
+    echo "  Next steps:"
+    echo "    ./manage profile:switch $name"
+    echo "    ./manage start"
+  fi
+}
+
+cmd_profile_clone() {
+  local src="${1:-}" dst="${2:-}"
+  [ -n "$src" ] && [ -n "$dst" ] || fail "Usage: $0 profile:clone <src> <dst>"
+  cmd_profile_create "$dst" --from "$src"
+}
+
+cmd_profile_switch() {
+  local target="${1:-}"
+  validate_profile_name "$target"
+  detect_compose
+  ensure_profiles_initialized
+
+  local current
+  current="$(get_active_profile)"
+  if [ "$target" = "$current" ]; then
+    warn "'$target' is already the active profile."
+    return 0
+  fi
+
+  if profile_archive_exists "$target" && ! profile_exists "$target"; then
+    fail "Profile '$target' is archived. Restore it first: ./manage profile:restore $target"
+  fi
+  profile_exists "$target" || fail "Profile '$target' does not exist. Create it with: ./manage profile:create $target"
+
+  # Stop whatever is running under the current profile
+  export_compose_project
+  if _services_are_running; then
+    info "Stopping services on profile '$current'..."
+    cmd_stop 2>/dev/null || true
+  fi
+
+  # Flip the active profile
+  echo "$target" > "$PROFILES_DIR/.active"
+  export_compose_project
+
+  # Update documents symlink
+  refresh_documents_symlink "$target"
+
+  ok "Switched to profile: $target"
+  echo ""
+  echo "  Start services:  ./manage start"
+
+  # Warn if target profile has no postgres volume yet
+  if ! docker volume inspect "$(profile_volume_name "$target" database-data)" >/dev/null 2>&1; then
+    echo ""
+    warn "Profile '$target' has no database volume yet. After './manage start':"
+    echo "    (cd backend && npm run migration:run && npm run feature:install)"
+  fi
+}
+
+cmd_profile_delete() {
+  local name="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      -*)    fail "Unknown flag: $1" ;;
+      *)     [ -z "$name" ] && name="$1" || fail "Unexpected argument: $1"; shift ;;
+    esac
+  done
+  validate_profile_name "$name"
+  detect_compose
+  ensure_profiles_initialized
+
+  profile_exists "$name" || fail "Profile '$name' does not exist."
+  [ "$name" = "$(get_active_profile)" ] && fail "Cannot delete the active profile. Switch to another first."
+
+  if [ "$yes" -ne 1 ]; then
+    echo "This will PERMANENTLY DELETE profile '$name' (documents + volumes)."
+    read -p "Type DELETE to continue: " confirm
+    [ "$confirm" = "DELETE" ] || { echo "Aborted."; exit 1; }
+  fi
+
+  for suffix in database-data qdrant_data neo4j_data; do
+    local vol
+    vol="$(profile_volume_name "$name" "$suffix")"
+    if docker volume inspect "$vol" >/dev/null 2>&1; then
+      info "  Removing volume: $vol"
+      docker volume rm "$vol" >/dev/null || warn "Could not remove $vol (in use?)"
+    fi
+  done
+  rm -rf "$PROFILES_DIR/$name"
+  ok "Profile '$name' deleted."
+}
+
+cmd_profile_rename() {
+  local old="${1:-}" new="${2:-}"
+  validate_profile_name "$old"
+  validate_profile_name "$new"
+  detect_compose
+  ensure_profiles_initialized
+
+  profile_exists "$old" || fail "Profile '$old' does not exist."
+  profile_exists "$new" && fail "Profile '$new' already exists."
+
+  if [ "$old" = "$(get_active_profile)" ] && _services_are_running; then
+    fail "Cannot rename the active profile while services are running. Stop them first."
+  fi
+
+  info "Renaming profile: $old -> $new"
+  # Rename volumes (must be done by create+copy+delete)
+  for suffix in database-data qdrant_data neo4j_data; do
+    local src_vol dst_vol
+    src_vol="$(profile_volume_name "$old" "$suffix")"
+    dst_vol="$(profile_volume_name "$new" "$suffix")"
+    if docker volume inspect "$src_vol" >/dev/null 2>&1; then
+      info "  Renaming volume: $src_vol -> $dst_vol"
+      clone_docker_volume "$src_vol" "$dst_vol"
+      docker volume rm "$src_vol" >/dev/null 2>&1 || warn "Could not remove $src_vol"
+    fi
+  done
+  mv "$PROFILES_DIR/$old" "$PROFILES_DIR/$new"
+
+  # Update metadata name
+  if [ -f "$PROFILES_DIR/$new/metadata.json" ]; then
+    sed -i "s/\"name\"[[:space:]]*:[[:space:]]*\"$old\"/\"name\": \"$new\"/" "$PROFILES_DIR/$new/metadata.json"
+  fi
+
+  # Update active pointer if needed
+  if [ "$old" = "$(get_active_profile)" ]; then
+    echo "$new" > "$PROFILES_DIR/.active"
+    refresh_documents_symlink "$new"
+  fi
+  ok "Profile renamed to '$new'."
+}
+
+cmd_profile_archive() {
+  local name="${1:-}"
+  validate_profile_name "$name"
+  detect_compose
+  ensure_profiles_initialized
+
+  profile_exists "$name" || fail "Profile '$name' does not exist."
+  [ "$name" = "$(get_active_profile)" ] && fail "Cannot archive the active profile. Switch to another first."
+  profile_archive_exists "$name" && fail "An archive already exists at .profiles/archived/${name}.tar.gz"
+
+  info "Archiving profile '$name'..."
+  local TMPDIR
+  TMPDIR="$(mktemp -d)"
+  trap 'rm -rf "$TMPDIR"' RETURN
+
+  mkdir -p "$TMPDIR/documents" "$TMPDIR/documents-archive"
+  if [ -d "$PROFILES_DIR/$name/documents" ] && [ -n "$(ls -A "$PROFILES_DIR/$name/documents" 2>/dev/null || true)" ]; then
+    (cd "$PROFILES_DIR/$name/documents" && tar cf - .) | (cd "$TMPDIR/documents" && tar xf -)
+  fi
+  if archive_dir_is_in_profile "$name" && [ -d "$PROFILES_DIR/$name/documents-archive" ] && [ -n "$(ls -A "$PROFILES_DIR/$name/documents-archive" 2>/dev/null || true)" ]; then
+    (cd "$PROFILES_DIR/$name/documents-archive" && tar cf - .) | (cd "$TMPDIR/documents-archive" && tar xf -)
+  elif ! archive_dir_is_in_profile "$name"; then
+    warn "DOCUMENTS_ARCHIVE_DIR is set to an external path; archived files for '$name' are NOT included in the archive."
+    warn "Back up '$DOCUMENTS_ARCHIVE_DIR' separately if you want to preserve them."
+  fi
+  cp "$PROFILES_DIR/$name/metadata.json" "$TMPDIR/metadata.json" 2>/dev/null || true
+
+  for suffix in database-data qdrant_data neo4j_data; do
+    local vol
+    vol="$(profile_volume_name "$name" "$suffix")"
+    if docker volume inspect "$vol" >/dev/null 2>&1; then
+      info "  Dumping volume: $vol"
+      _dump_volume_to_tar "$vol" "$TMPDIR/${suffix}.tar"
+    fi
+  done
+
+  mkdir -p "$PROFILES_DIR/archived"
+  local out="$PROFILES_DIR/archived/${name}.tar.gz"
+  info "  Compressing archive..."
+  tar -czf "$out" -C "$TMPDIR" .
+
+  # Remove live profile state
+  for suffix in database-data qdrant_data neo4j_data; do
+    local vol
+    vol="$(profile_volume_name "$name" "$suffix")"
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+  done
+  rm -rf "$PROFILES_DIR/$name"
+
+  ok "Profile '$name' archived to $out ($(du -h "$out" | cut -f1))"
+}
+
+cmd_profile_restore() {
+  local name="${1:-}"
+  validate_profile_name "$name"
+  detect_compose
+  ensure_profiles_initialized
+
+  profile_archive_exists "$name" || fail "No archive found at .profiles/archived/${name}.tar.gz"
+  profile_exists "$name" && fail "Profile '$name' already exists as a live profile."
+
+  info "Restoring profile '$name'..."
+  local TMPDIR
+  TMPDIR="$(mktemp -d)"
+  trap 'rm -rf "$TMPDIR"' RETURN
+
+  tar -xzf "$PROFILES_DIR/archived/${name}.tar.gz" -C "$TMPDIR"
+
+  mkdir -p "$PROFILES_DIR/$name/documents" "$PROFILES_DIR/$name/documents-archive"
+  if [ -d "$TMPDIR/documents" ] && [ -n "$(ls -A "$TMPDIR/documents" 2>/dev/null || true)" ]; then
+    (cd "$TMPDIR/documents" && tar cf - .) | (cd "$PROFILES_DIR/$name/documents" && tar xf -)
+  fi
+  if [ -d "$TMPDIR/documents-archive" ] && [ -n "$(ls -A "$TMPDIR/documents-archive" 2>/dev/null || true)" ]; then
+    (cd "$TMPDIR/documents-archive" && tar cf - .) | (cd "$PROFILES_DIR/$name/documents-archive" && tar xf -)
+  fi
+
+  if [ -f "$TMPDIR/metadata.json" ]; then
+    cp "$TMPDIR/metadata.json" "$PROFILES_DIR/$name/metadata.json"
+  else
+    cat > "$PROFILES_DIR/$name/metadata.json" <<METAEOF
+{
+  "name": "$name",
+  "created_at": "$(date -Iseconds)",
+  "description": "Restored from archive"
+}
+METAEOF
+  fi
+
+  for suffix in database-data qdrant_data neo4j_data; do
+    if [ -f "$TMPDIR/${suffix}.tar" ]; then
+      local vol
+      vol="$(profile_volume_name "$name" "$suffix")"
+      info "  Loading volume: $vol"
+      _load_tar_into_volume "$TMPDIR/${suffix}.tar" "$vol"
+    fi
+  done
+
+  rm -f "$PROFILES_DIR/archived/${name}.tar.gz"
+  ok "Profile '$name' restored. Switch to it with: ./manage profile:switch $name"
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -760,12 +1492,20 @@ Commands:
                           - Start PostgreSQL + Qdrant (Docker)
                           - Run each submodule's install.sh
 
-  start                   Start all services:
+  start [components...]   Start services. With no args, starts everything:
                           - PostgreSQL + Qdrant (Docker)
                           - Backend (local, npm run start:dev)
                           - Models (local, python jobs.py in .venv)
+                          With component names, only those are started:
+                            ./manage start backend
+                            ./manage start models database
+                          Valid components: backend, models, database, qdrant, neo4j.
 
-  stop                    Stop all services
+  stop [components...]    Stop services. With no args, stops everything (incl. docker).
+                          With component names, only those are stopped (docker
+                          infra stays up unless explicitly named):
+                            ./manage stop backend
+                            ./manage stop models qdrant
 
   reset [--yes]           Permanently delete all project data and re-initialize.
                           --yes  Skip confirmation prompt
@@ -776,11 +1516,34 @@ Commands:
 
   logs <service>          Tail logs for a service (backend, models, playground)
 
-  export [output_file]    Create a compressed backup of the database and documents.
+  export [output_file]    Create a compressed backup of the active profile's database and documents.
 
-  import <backup_file>    Restore database and documents from a backup file.
+  import <backup_file>    Restore database and documents into the active profile.
+
+  profile:list                         List all data profiles (live + archived).
+  profile:current                      Print the name of the active profile.
+  profile:create <name> [--from <src>|--empty]
+                                       Create a new profile. --from <src|current> clones DB + documents
+                                       from another profile; --empty (default) creates blank state.
+  profile:clone <src> <dst>            Shortcut for 'profile:create <dst> --from <src>'.
+  profile:switch <name>                Stop services and switch the active profile. Start again with 'start'.
+  profile:rename <old> <new>           Rename a profile (requires services stopped if renaming the active one).
+  profile:delete <name> [--yes]        Delete a profile (documents + volumes). Cannot delete the active one.
+  profile:archive <name>               Pack a profile into .profiles/archived/<name>.tar.gz (and remove live state).
+  profile:restore <name>               Unpack an archived profile back into live state.
 
   help                    Show this help message.
+
+Notes:
+  Each profile has two file stores:
+    - documents/          Hot storage (active resource files).
+    - documents-archive/  Cold storage (resources archived from the app's UI).
+
+  By default, both live inside .profiles/<profile>/. Override the cold store
+  with the env var DOCUMENTS_ARCHIVE_DIR to point to a slower/cheaper mount
+  (HDD, NAS, S3 mount, ...). When DOCUMENTS_ARCHIVE_DIR is external, the
+  profile commands above (archive, restore, export, import, reset) will
+  NOT touch it — back it up separately if needed.
 EOF
 }
 
@@ -800,6 +1563,15 @@ case "$COMMAND" in
   logs)               cmd_logs "$@" ;;
   export)             cmd_export "$@" ;;
   import)             cmd_import "$@" ;;
+  profile:list)       cmd_profile_list "$@" ;;
+  profile:current)    cmd_profile_current "$@" ;;
+  profile:create)     cmd_profile_create "$@" ;;
+  profile:clone)      cmd_profile_clone "$@" ;;
+  profile:switch)     cmd_profile_switch "$@" ;;
+  profile:rename)     cmd_profile_rename "$@" ;;
+  profile:delete)     cmd_profile_delete "$@" ;;
+  profile:archive)    cmd_profile_archive "$@" ;;
+  profile:restore)    cmd_profile_restore "$@" ;;
   help|--help|-h) show_help ;;
   *) fail "Unknown command: $COMMAND. Run '$0 help' for usage." ;;
 esac
