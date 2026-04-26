@@ -14,3 +14,5 @@ models/venv/
 .pids
 .env
 .logs/
+documents/**
+documents-archive/**
