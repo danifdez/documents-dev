@@ -494,7 +494,7 @@ save_pidfile() {
 
 source_pidfile() {
   BACKEND_PID="" ; MODELS_PID="" ; LOG_WATCHDOG_PID=""
-  [ -f "$PIDFILE" ] && source "$PIDFILE"
+  if [ -f "$PIDFILE" ]; then source "$PIDFILE"; fi
 }
 
 ensure_log_watchdog() {
