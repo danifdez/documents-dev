@@ -405,6 +405,35 @@ ensure_pg_extensions() {
   ok "PostgreSQL extensions ready (pg_trgm, unaccent)"
 }
 
+# ── Initialize DB: migrations + features (for a fresh profile) ────
+init_db() {
+  local profile="${1:-$(get_active_profile)}"
+  info "Initializing database for profile '$profile'..."
+
+  # Ensure COMPOSE_PROJECT_NAME targets the right profile
+  local prev_project="${COMPOSE_PROJECT_NAME:-}"
+  export COMPOSE_PROJECT_NAME="$(profile_project_name "$profile")"
+
+  start_docker_service database
+
+  info "Running migrations..."
+  (cd "$ROOT_DIR/backend" && npm run migration:run 2>&1 | grep -E "successfully|failed|Error") || fail "Migrations failed."
+  ok "Migrations complete"
+
+  info "Installing features..."
+  local db_container
+  db_container="$(profile_project_name "$profile")-database-1"
+  for feature in authors bibliography calendar canvas datasets data-sources entities knowledge_base notes tasks timelines; do
+    local sql_file="$ROOT_DIR/backend/features/$feature/install.sql"
+    if [ -f "$sql_file" ]; then
+      docker exec -i "$db_container" psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" < "$sql_file" > /dev/null 2>&1 || warn "Feature '$feature' had warnings (usually safe to ignore)"
+    fi
+  done
+  ok "Features installed"
+
+  export COMPOSE_PROJECT_NAME="$prev_project"
+}
+
 # ════════════════════════════════════════════════════════════════════
 # INSTALL
 # ════════════════════════════════════════════════════════════════════
@@ -1238,18 +1267,10 @@ cmd_profile_create() {
 METAEOF
 
   ok "Profile '$name' created."
-  if [ "$mode" = "empty" ]; then
-    echo ""
-    echo "  Next steps:"
-    echo "    ./manage profile:switch $name"
-    echo "    ./manage start"
-    echo "    (cd backend && npm run migration:run && npm run feature:install)"
-  else
-    echo ""
-    echo "  Next steps:"
-    echo "    ./manage profile:switch $name"
-    echo "    ./manage start"
-  fi
+  echo ""
+  echo "  Next steps:"
+  echo "    ./manage profile:switch $name"
+  echo "    ./manage start"
 }
 
 cmd_profile_clone() {
@@ -1294,12 +1315,13 @@ cmd_profile_switch() {
   echo ""
   echo "  Start services:  ./manage start"
 
-  # Warn if target profile has no postgres volume yet
+  # Initialize DB if the target profile has no postgres volume yet
   if ! docker volume inspect "$(profile_volume_name "$target" database-data)" >/dev/null 2>&1; then
-    echo ""
-    warn "Profile '$target' has no database volume yet. After './manage start':"
-    echo "    (cd backend && npm run migration:run && npm run feature:install)"
+    init_db "$target"
   fi
+
+  echo ""
+  echo "  Start services:  ./manage start"
 }
 
 cmd_profile_delete() {
