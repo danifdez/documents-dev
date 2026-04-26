@@ -1,5 +1,5 @@
-documents/**
-documents-archive/**
+documents
+documents-archive
 .profiles/
 playground/.ipynb_checkpoints
 playground/.Trash-1000
@@ -14,5 +14,3 @@ models/venv/
 .pids
 .env
 .logs/
-documents/**
-documents-archive/**
