@@ -92,13 +92,24 @@ is_rag_enabled() {
   fi
 }
 
-# Returns the docker compose services to start
-get_compose_services() {
-  if is_rag_enabled; then
-    echo ""  # empty = all services
+# ── Check if Relationships feature is enabled ────────────────
+is_relationships_enabled() {
+  local backend_env="$ROOT_DIR/backend/.env"
+  if [ -f "$backend_env" ]; then
+    local val
+    val=$(grep -E '^FEATURE_RELATIONSHIPS=' "$backend_env" 2>/dev/null | cut -d= -f2)
+    [ "$val" != "false" ]
   else
-    echo "database"
+    return 0  # Default: enabled
   fi
+}
+
+# Returns the docker compose services to start based on enabled features
+get_compose_services() {
+  local services=("database")
+  is_rag_enabled && services+=("qdrant")
+  is_relationships_enabled && services+=("neo4j")
+  echo "${services[@]}"
 }
 
 # ── Data profiles (versioned DB + documents) ────────────────────────
@@ -485,6 +496,15 @@ cmd_install() {
     info "RAG disabled – skipping Qdrant"
   fi
 
+  # Start Neo4j only if Relationships is enabled
+  if is_relationships_enabled; then
+    info "Relationships enabled – starting Neo4j..."
+    $COMPOSE_CMD up -d neo4j
+    ok "Neo4j started"
+  else
+    info "Relationships disabled – skipping Neo4j"
+  fi
+
   info "Installing models service..."
   cd "$ROOT_DIR/models"
   bash install
@@ -645,6 +665,9 @@ print_start_summary() {
   if is_rag_enabled; then
     echo "  Qdrant:         http://localhost:6333"
   fi
+  if is_relationships_enabled; then
+    echo "  Neo4j:          http://localhost:7474"
+  fi
   echo ""
   echo "  Logs:"
   echo "    Backend:      tail -f .backend.log"
@@ -671,6 +694,7 @@ cmd_start() {
         backend)
           start_docker_service database
           if is_rag_enabled; then start_docker_service qdrant; fi
+          if is_relationships_enabled; then start_docker_service neo4j; fi
           ensure_log_watchdog
           start_backend
           ;;
@@ -702,13 +726,10 @@ cmd_start() {
     return 0
   fi
 
-  if is_rag_enabled; then
-    info "Starting database and qdrant..."
-    $COMPOSE_CMD up -d
-  else
-    info "Starting database (RAG disabled, skipping qdrant)..."
-    $COMPOSE_CMD up -d database
-  fi
+  local services
+  read -ra services <<< "$(get_compose_services)"
+  info "Starting infrastructure: ${services[*]}..."
+  $COMPOSE_CMD up -d "${services[@]}"
   wait_for_postgres 30
   ensure_pg_extensions
 
