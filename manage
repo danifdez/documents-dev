@@ -337,6 +337,7 @@ is_service_running() {
   case "$name" in
     backend) pgrep -f "nest start" >/dev/null 2>&1 && return 0 ;;
     models)  pgrep -f "python jobs.py" >/dev/null 2>&1 && return 0 ;;
+    voice)   pgrep -f "voice.run_pool" >/dev/null 2>&1 && return 0 ;;
   esac
   return 1  # not running
 }
@@ -538,11 +539,12 @@ cmd_install() {
 save_pidfile() {
   echo "BACKEND_PID=${BACKEND_PID:-}" > "$PIDFILE"
   echo "MODELS_PID=${MODELS_PID:-}" >> "$PIDFILE"
+  echo "VOICE_PID=${VOICE_PID:-}" >> "$PIDFILE"
   echo "LOG_WATCHDOG_PID=${LOG_WATCHDOG_PID:-}" >> "$PIDFILE"
 }
 
 source_pidfile() {
-  BACKEND_PID="" ; MODELS_PID="" ; LOG_WATCHDOG_PID=""
+  BACKEND_PID="" ; MODELS_PID="" ; VOICE_PID="" ; LOG_WATCHDOG_PID=""
   if [ -f "$PIDFILE" ]; then source "$PIDFILE"; fi
 }
 
@@ -596,6 +598,43 @@ start_models() {
   save_pidfile
 }
 
+# ── Voice (live dictation) worker ──
+# Pool of Python workers serving live dictation. Opt-in: not started by
+# `manage start` without args so it doesn't consume RAM on machines that
+# don't use backend-side dictation. Pool size via VOICE_WORKER_POOL_SIZE
+# (default 1) or VOICE_WORKER_PORTS (explicit ports).
+start_voice_worker() {
+  source_pidfile
+  if is_service_running voice VOICE_PID; then
+    warn "Voice worker is already running. Skipping."
+    return 0
+  fi
+  ensure_log_dir
+  rotate_log "$ROOT_DIR/.voice.log"
+  kill_by_pattern "voice.run_pool" "voice orphan" 2>/dev/null || true
+  kill_by_pattern "voice.run_live_worker" "voice orphan" 2>/dev/null || true
+  info "Starting voice worker pool (size=${VOICE_WORKER_POOL_SIZE:-1})..."
+  cd "$ROOT_DIR/models"
+  source .venv/bin/activate
+  setsid python -m voice.run_pool > "$ROOT_DIR/.voice.log" 2>&1 &
+  VOICE_PID=$!
+  deactivate
+  cd "$ROOT_DIR"
+  ok "Voice worker started (PGID: $VOICE_PID)"
+  save_pidfile
+}
+
+stop_voice_worker() {
+  source_pidfile
+  if [ -n "${VOICE_PID:-}" ] && kill_process_group "${VOICE_PID}"; then
+    ok "Voice worker process group stopped (PGID: ${VOICE_PID})"
+  fi
+  VOICE_PID=""
+  save_pidfile
+  kill_by_pattern "voice.run_pool" "voice orphan" 2>/dev/null || true
+  kill_by_pattern "voice.run_live_worker" "voice orphan" 2>/dev/null || true
+}
+
 start_docker_service() {
   local svc="$1"
   detect_compose
@@ -643,7 +682,7 @@ stop_docker_service() {
 
 is_known_component() {
   case "$1" in
-    backend|models|database|qdrant|neo4j) return 0 ;;
+    backend|models|voice|database|qdrant|neo4j) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -660,6 +699,9 @@ print_start_summary() {
   fi
   if [ -n "${MODELS_PID:-}" ]; then
     echo "  Models:         running                (PID: $MODELS_PID)"
+  fi
+  if [ -n "${VOICE_PID:-}" ]; then
+    echo "  Voice worker:   running                (PID: $VOICE_PID)"
   fi
   echo "  PostgreSQL:     localhost:5432"
   if is_rag_enabled; then
@@ -687,7 +729,7 @@ cmd_start() {
   # Per-component start
   if [ $# -gt 0 ]; then
     for component in "$@"; do
-      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, database, qdrant, neo4j)"
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database, qdrant, neo4j)"
     done
     for component in "$@"; do
       case "$component" in
@@ -701,6 +743,10 @@ cmd_start() {
         models)
           ensure_log_watchdog
           start_models
+          ;;
+        voice)
+          ensure_log_watchdog
+          start_voice_worker
           ;;
         database|qdrant|neo4j)
           start_docker_service "$component"
@@ -753,12 +799,13 @@ cmd_stop() {
   # Per-component stop (don't tear down docker infra unless explicitly named)
   if [ $# -gt 0 ]; then
     for component in "$@"; do
-      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, database, qdrant, neo4j)"
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database, qdrant, neo4j)"
     done
     for component in "$@"; do
       case "$component" in
         backend) stop_backend ;;
         models)  stop_models ;;
+        voice)   stop_voice_worker ;;
         database|qdrant|neo4j) stop_docker_service "$component" ;;
       esac
     done
@@ -776,6 +823,9 @@ cmd_stop() {
     if kill_process_group "${MODELS_PID:-}"; then
       ok "Models process group stopped (PGID: ${MODELS_PID})"
     fi
+    if kill_process_group "${VOICE_PID:-}"; then
+      ok "Voice worker process group stopped (PGID: ${VOICE_PID})"
+    fi
     if [ -n "${LOG_WATCHDOG_PID:-}" ] && kill -0 "${LOG_WATCHDOG_PID}" 2>/dev/null; then
       kill "${LOG_WATCHDOG_PID}" 2>/dev/null || true
       ok "Log watchdog stopped"
@@ -788,6 +838,8 @@ cmd_stop() {
   kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
   kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
   kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
+  kill_by_pattern "voice.run_pool" "voice orphan" 2>/dev/null || true
+  kill_by_pattern "voice.run_live_worker" "voice orphan" 2>/dev/null || true
 
   local port_pid
   port_pid=$(lsof -ti:3000 2>/dev/null || true)
