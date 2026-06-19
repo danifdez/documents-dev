@@ -67,6 +67,10 @@ build_backend() {
   mkdir -p "$staging"
 
   cp -r dist "$staging/dist"
+  # Seed files (e.g. resource-type.csv) are read at runtime by migrations but
+  # aren't compiled into dist. Ship them at dist/data so the migration's
+  # __dirname/../data lookup resolves regardless of the process cwd.
+  [ -d data ] && cp -r data "$staging/dist/data"
   cp package.json "$staging/package.json"
   cp package-lock.json "$staging/package-lock.json" 2>/dev/null || true
 
@@ -76,11 +80,13 @@ build_backend() {
 
   mkdir -p "$RELEASE_DIR"
   local name="documents-backend-v${APP_VERSION}-${PLATFORM}"
-  cd "$ROOT_DIR/.build-staging"
+  # Archive the contents of backend/ (not the dir itself) so the app extracts
+  # straight into standalone-services/backend/ without a doubled prefix.
+  cd "$ROOT_DIR/.build-staging/backend"
   if [ "$(archive_ext)" = "zip" ]; then
-    zip -qr "$RELEASE_DIR/${name}.zip" backend
+    zip -qr "$RELEASE_DIR/${name}.zip" .
   else
-    tar czf "$RELEASE_DIR/${name}.tar.gz" backend
+    tar czf "$RELEASE_DIR/${name}.tar.gz" .
   fi
 
   rm -rf "$ROOT_DIR/.build-staging/backend"
@@ -125,15 +131,47 @@ build_models() {
 
   cd "$ROOT_DIR/models"
 
-  if ! command -v pyinstaller >/dev/null 2>&1; then
-    info "Installing PyInstaller..."
-    pip install pyinstaller --quiet
+  [ -f "jobs.py" ] || fail "models/jobs.py not found"
+
+  # Each variant builds in its OWN venv with its OWN deps. CPU and CUDA builds of
+  # torch/llama-cpp-python can't coexist in one environment, so the variant must
+  # decide what gets installed — not just the asset name.
+  local venv="$ROOT_DIR/.build-staging/venv-models-${variant}"
+  info "Creating isolated build venv (${variant})..."
+  rm -rf "$venv"
+  python3 -m venv "$venv"
+  if [ -f "$venv/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source "$venv/bin/activate"
+  else
+    # shellcheck disable=SC1091
+    source "$venv/Scripts/activate"  # Windows (MSYS/Git-Bash)
   fi
 
-  [ -f "jobs.py" ] || fail "models/jobs.py not found"
+  info "Installing ${variant} dependencies (downloads several GB)..."
+  pip install --quiet --upgrade pip
+  if [ "$variant" = "gpu" ]; then
+    # GPU wheels first (CUDA torch + cupy via their extra-index-url), then the
+    # rest; requirements.txt sees torch/llama-cpp already satisfied and won't pull
+    # the CPU builds over them.
+    pip install --quiet -r requirements-gpu.txt
+    # llama-cpp-python: the abetlen cu126 prebuilt index has no wheel for current
+    # Python, so any pip index resolution silently lands on the CPU wheel from
+    # PyPI (then the LLM runs on CPU — no libggml-cuda.so bundled). Compile it
+    # from source with CUDA instead. Requires nvcc + cmake + CUDA dev libs
+    # (libcublas/libcudart) on the build host.
+    command -v nvcc >/dev/null 2>&1 || fail "gpu build needs nvcc (CUDA toolkit) to compile llama-cpp-python with CUDA"
+    CMAKE_ARGS="-DGGML_CUDA=on" pip install --quiet --no-binary llama-cpp-python --no-cache-dir llama-cpp-python
+  fi
+  pip install --quiet -r requirements.txt
+  pip install --quiet pyinstaller
 
   info "Bundling Python + dependencies (this takes a while)..."
 
+  # Task handlers are imported by convention at runtime (tasks/<type>/<type>.py),
+  # so PyInstaller can't see them statically — collect them explicitly. Bundle
+  # the config defaults, task configs and prompt.md files as data so the frozen
+  # worker can read them from sys._MEIPASS.
   pyinstaller \
     --name documents-models \
     --onedir \
@@ -145,6 +183,10 @@ build_models() {
     --collect-all llama_cpp \
     --collect-all docling \
     --collect-all diffusers \
+    --collect-submodules tasks \
+    --add-data "common:common" \
+    --add-data "config:config" \
+    --add-data "tasks:tasks" \
     --hidden-import=tiktoken_ext.openai_public \
     --hidden-import=tiktoken_ext \
     jobs.py
@@ -162,13 +204,17 @@ build_models() {
 
   mkdir -p "$RELEASE_DIR"
   local name="documents-models-v${APP_VERSION}-${PLATFORM}-${variant}"
+  # Archive the CONTENTS of the onedir bundle (not the dir itself) so the app
+  # extracts the binary straight into models-service/ without a doubled prefix
+  # (otherwise models-service/documents-models is a dir and spawn() gets EACCES).
   if [ "$(archive_ext)" = "zip" ]; then
-    cd dist && zip -qr "$RELEASE_DIR/${name}.zip" documents-models && cd ..
+    ( cd dist/documents-models && zip -qr "$RELEASE_DIR/${name}.zip" . )
   else
-    tar czf "$RELEASE_DIR/${name}.tar.gz" -C dist documents-models
+    tar czf "$RELEASE_DIR/${name}.tar.gz" -C dist/documents-models .
   fi
   ok "Models asset: $RELEASE_DIR/${name}.$(archive_ext) ($(du -sh "$RELEASE_DIR/${name}."* | cut -f1))"
 
+  deactivate || true
   cd "$ROOT_DIR"
 }
 
@@ -187,6 +233,36 @@ clean() {
 }
 
 # ════════════════════════════════════════════════════════════════════
+# SERVE LOCALLY (stand in for GitHub Releases)
+# ════════════════════════════════════════════════════════════════════
+serve_local() {
+  local port="${1:-8000}"
+  step "Serving release-assets as a local release server"
+
+  [ -d "$RELEASE_DIR" ] || fail "No release-assets/. Build first (e.g. ./build-release backend && ./build-release models-cpu)."
+
+  # The app requests \$BASE/v1.0.0/<asset>; expose the assets under that tag dir
+  # via symlinks so the existing flat release-assets/ keeps working too.
+  local tag="v${APP_VERSION}"
+  local tagdir="$RELEASE_DIR/$tag"
+  mkdir -p "$tagdir"
+  shopt -s nullglob
+  for f in "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR"/*.zip; do
+    ln -sf "../$(basename "$f")" "$tagdir/$(basename "$f")"
+  done
+  shopt -u nullglob
+
+  info "Assets available under $tag/:"
+  ls -1 "$tagdir" 2>/dev/null | sed 's/^/  /' || warn "  (none — build the assets first)"
+  echo ""
+  ok "Launch the app pointing at this server:"
+  printf "  ${BOLD}DOCUMENTS_RELEASE_BASE_URL=http://localhost:%s npm start${NC}  ${DIM}(run in frontend/)${NC}\n\n" "$port"
+  info "Serving on http://localhost:$port — Ctrl-C to stop"
+  cd "$RELEASE_DIR"
+  python3 -m http.server "$port"
+}
+
+# ════════════════════════════════════════════════════════════════════
 # HELP
 # ════════════════════════════════════════════════════════════════════
 show_help() {
@@ -199,7 +275,7 @@ Databases (PostgreSQL, Qdrant, Neo4j) are downloaded by the app directly
 from their official sources — they are NOT packaged here.
 
 ${BOLD}Usage:${NC}
-  ./build-standalone [command]
+  ./build-release [command]
 
 ${BOLD}Commands:${NC}
   ${GREEN}all${NC}             Build backend asset + Electron installer
@@ -207,13 +283,30 @@ ${BOLD}Commands:${NC}
   ${GREEN}backend${NC}         Build the backend release asset (~50 MB)
   ${GREEN}models-cpu${NC}      Build the models service for CPU (~2 GB)
   ${GREEN}models-gpu${NC}      Build the models service for GPU/CUDA (~5 GB)
+  ${GREEN}models-all${NC}      Build both CPU and GPU variants
+  ${GREEN}serve [port]${NC}    Serve release-assets/ locally as a stand-in for GitHub
+                  Releases (default port 8000)
   ${GREEN}clean${NC}           Remove all build artifacts
   ${GREEN}help${NC}            Show this help
 
+${BOLD}Test standalone locally (without GitHub):${NC}
+  1. ./build-release backend           # ~50 MB, quick
+  2. ./build-release models-cpu         # ~2 GB, slow (downloads deps)
+  3. ./build-release serve              # serves release-assets/ on :8000
+  4. cd frontend && DOCUMENTS_RELEASE_BASE_URL=http://localhost:8000 npm start
+     (DBs still come from their official sources — needs internet)
+
+${BOLD}Covering "any machine":${NC}
+  Each models variant builds in its own venv with its own deps (CPU vs CUDA).
+  The wizard detects the user's GPU at runtime and downloads the right one.
+  ${YELLOW}Limits:${NC} PyInstaller does NOT cross-compile — run this script once per OS
+  (Linux/Windows/macOS) to cover them. The GPU variant needs the CUDA wheels
+  reachable (build host needs internet; a physical GPU is not required to build).
+
 ${BOLD}Workflow:${NC}
-  1. ./build-standalone backend       # Build backend asset
+  1. ./build-release backend       # Build backend asset
   2. Upload release-assets/ to GitHub Releases
-  3. ./build-standalone installer     # Build the lightweight installer
+  3. ./build-release installer     # Build the lightweight installer
   4. Distribute the installer
 
 ${BOLD}What the app downloads at runtime (from official sources):${NC}
@@ -258,6 +351,8 @@ case "$COMMAND" in
   backend)      build_backend ;;
   models-cpu)   build_models cpu ;;
   models-gpu)   build_models gpu ;;
+  models-all)   build_models cpu; build_models gpu ;;
+  serve)        serve_local "${1:-8000}" ;;
   clean)
     clean
     if [ "${1:-}" = "all" ]; then
