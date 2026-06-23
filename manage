@@ -47,13 +47,10 @@ setup_env_root() {
   ask "PostgreSQL database" "documents";        local PG_DB="$REPLY"
   ask "PostgreSQL user" "postgres";             local PG_USER="$REPLY"
   ask "PostgreSQL password" "example";          local PG_PASS="$REPLY"
-  ask "Enable AI / RAG feature (true/false)" "true"; local RAG_ENABLED="$REPLY"
 
   local QD_HOST="localhost" QD_PORT="6333"
-  if [ "$RAG_ENABLED" != "false" ]; then
-    ask "Qdrant host" "localhost";                QD_HOST="$REPLY"
-    ask "Qdrant port" "6333";                     QD_PORT="$REPLY"
-  fi
+  ask "Qdrant host" "localhost";                QD_HOST="$REPLY"
+  ask "Qdrant port" "6333";                     QD_PORT="$REPLY"
 
   cat > "$ENV_FILE" <<EOF
 # Database
@@ -68,6 +65,72 @@ QDRANT_HOST=$QD_HOST
 QDRANT_PORT=$QD_PORT
 EOF
   ok "Created .env"
+}
+
+# ── Pre-generate per-service configs, non-interactively, with every feature ──
+# enabled. This is where the "everything on by default" policy lives: the
+# per-service `install` scripts stay fully interactive when run on their own, but
+# under `manage install` we write their config up front so they detect it and
+# skip their prompts. DB/Qdrant values come from the root .env (already loaded).
+setup_service_envs() {
+  # Backend: the example already has every FEATURE_* = true; just patch the DB.
+  local be="$ROOT_DIR/backend/.env"
+  if [ -f "$be" ]; then
+    ok "backend/.env already exists (skipping)"
+  else
+    cp "$ROOT_DIR/backend/.env.example" "$be"
+    sed -i \
+      -e "s|^POSTGRES_HOST=.*|POSTGRES_HOST=${POSTGRES_HOST:-localhost}|" \
+      -e "s|^POSTGRES_PORT=.*|POSTGRES_PORT=${POSTGRES_PORT:-5432}|" \
+      -e "s|^POSTGRES_DB=.*|POSTGRES_DB=${POSTGRES_DB:-documents}|" \
+      -e "s|^POSTGRES_USER=.*|POSTGRES_USER=${POSTGRES_USER:-postgres}|" \
+      -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-example}|" \
+      "$be"
+    ok "Created backend/.env (all features enabled)"
+  fi
+
+  # Frontend: only needs the backend API URL.
+  local fe="$ROOT_DIR/frontend/.env"
+  if [ -f "$fe" ]; then
+    ok "frontend/.env already exists (skipping)"
+  else
+    printf 'VITE_API_URL=http://localhost:3000\n' > "$fe"
+    ok "Created frontend/.env"
+  fi
+
+  # Models: config.json from defaults (Qdrant on), patched with DB + Qdrant.
+  local mcfg="$ROOT_DIR/models/config/config.json"
+  if [ -f "$mcfg" ]; then
+    ok "models/config/config.json already exists (skipping)"
+  else
+    mkdir -p "$ROOT_DIR/models/config/tasks"
+    POSTGRES_HOST="${POSTGRES_HOST:-localhost}" POSTGRES_PORT="${POSTGRES_PORT:-5432}" \
+    POSTGRES_DB="${POSTGRES_DB:-documents}" POSTGRES_USER="${POSTGRES_USER:-postgres}" \
+    POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-example}" QDRANT_HOST="${QDRANT_HOST:-localhost}" \
+    QDRANT_PORT="${QDRANT_PORT:-6333}" python3 - "$ROOT_DIR/models" <<'PY'
+import json, os, shutil, sys
+root = sys.argv[1]
+cfg = json.load(open(os.path.join(root, 'common/config.default.json')))
+cfg['database'].update({
+    'host': os.environ['POSTGRES_HOST'],
+    'port': int(os.environ['POSTGRES_PORT']),
+    'name': os.environ['POSTGRES_DB'],
+    'user': os.environ['POSTGRES_USER'],
+    'password': os.environ['POSTGRES_PASSWORD'],
+})
+cfg['qdrant'].update({
+    'enabled': True,
+    'host': os.environ['QDRANT_HOST'],
+    'port': int(os.environ['QDRANT_PORT']),
+})
+with open(os.path.join(root, 'config/config.json'), 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+shutil.copy(os.path.join(root, 'common/tasks.default.json'),
+            os.path.join(root, 'config/tasks.json'))
+PY
+    ok "Created models/config/config.json + tasks.json (all features enabled)"
+  fi
 }
 
 # ── Load .env if present (export vars for docker-compose and scripts) ──
@@ -470,6 +533,10 @@ cmd_install() {
 
   # Reload env so docker-compose and scripts use the configured values
   load_env
+
+  # ── Pre-generate service configs (all features enabled, non-interactive) ──
+  info "Generating service configuration (all features enabled)..."
+  setup_service_envs
 
   # ── Initialize profile system (default profile + documents symlink) ──
   ensure_profiles_initialized
