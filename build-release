@@ -42,6 +42,11 @@ detect_platform() {
 PLATFORM="$(detect_platform)"
 info "Detected platform: $PLATFORM"
 
+# Determine Electron version used by the frontend so we can rebuild native
+# modules for the Electron runtime when packaging the backend. Falls back to
+# empty string if not found.
+ELECTRON_VERSION="$(node -e 'try{const p=require("./frontend/package.json"); console.log(p.dependencies?.electron||p.devDependencies?.electron||p.electron||"")}catch(e){console.log("")}' 2>/dev/null || true)"
+
 archive_ext() {
   [ "$PLATFORM" = "win32-x64" ] && echo "zip" || echo "tar.gz"
 }
@@ -77,6 +82,18 @@ build_backend() {
   info "Installing production dependencies..."
   cd "$staging"
   npm ci --omit=dev --quiet 2>&1 | tail -3
+
+  # If we know the frontend Electron version, try to rebuild native modules
+  # against Electron's ABI so the packaged backend works when forked from the
+  # Electron process at runtime.
+  if [ -n "$ELECTRON_VERSION" ]; then
+    info "Electron version detected: $ELECTRON_VERSION — rebuilding native modules for Electron"
+    # install electron-rebuild temporarily
+    npm i --no-audit --no-fund electron-rebuild@latest --silent 2>/dev/null || true
+    npx electron-rebuild -v "$ELECTRON_VERSION" --module-dir . || warn "electron-rebuild failed; native modules may be incompatible"
+  else
+    warn "Electron version not detected — skipping electron-rebuild"
+  fi
 
   mkdir -p "$RELEASE_DIR"
   local name="documents-backend-v${APP_VERSION}-${PLATFORM}"
@@ -166,6 +183,15 @@ build_models() {
   pip install --quiet -r requirements.txt
   pip install --quiet pyinstaller
 
+  # Install the spaCy model as a real wheel BEFORE bundling so PyInstaller can
+  # collect both its code AND its dist-info metadata. spacy.load("en_core_web_sm")
+  # resolves the model via importlib.metadata (is_package), so without the
+  # metadata the frozen worker fails to load it and falls back to a network
+  # `pip/uv install` — which has no pip in the bundle and no venv for uv, aborting
+  # `--setup` with a SystemExit. Bundling the metadata makes load-by-name work.
+  info "Installing spaCy model into build venv..."
+  python -m spacy download en_core_web_sm --quiet 2>/dev/null || true
+
   info "Bundling Python + dependencies (this takes a while)..."
 
   # Task handlers are imported by convention at runtime (tasks/<type>/<type>.py),
@@ -178,8 +204,11 @@ build_models() {
     --noconfirm \
     --collect-all transformers \
     --collect-all sentence_transformers \
+    --collect-all huggingface_hub \
     --collect-all faster_whisper \
     --collect-all spacy \
+    --collect-all en_core_web_sm \
+    --copy-metadata en_core_web_sm \
     --collect-all llama_cpp \
     --collect-all docling \
     --collect-all diffusers \
@@ -191,16 +220,7 @@ build_models() {
     --hidden-import=tiktoken_ext \
     jobs.py
 
-  ok "Models service built"
-
-  info "Adding spaCy model..."
-  python -m spacy download en_core_web_sm --quiet 2>/dev/null || true
-  local spacy_path
-  spacy_path="$(python -c "import en_core_web_sm; print(en_core_web_sm.__path__[0])" 2>/dev/null || true)"
-  if [ -n "$spacy_path" ] && [ -d "$spacy_path" ]; then
-    cp -r "$spacy_path" dist/documents-models/en_core_web_sm
-    ok "spaCy en_core_web_sm included"
-  fi
+  ok "Models service built (spaCy model + metadata bundled in-place)"
 
   mkdir -p "$RELEASE_DIR"
   local name="documents-models-v${APP_VERSION}-${PLATFORM}-${variant}"
