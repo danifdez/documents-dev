@@ -211,7 +211,6 @@ build_models() {
     --copy-metadata en_core_web_sm \
     --collect-all llama_cpp \
     --collect-all docling \
-    --collect-all diffusers \
     --collect-submodules tasks \
     --add-data "common:common" \
     --add-data "config:config" \
