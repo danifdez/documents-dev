@@ -27,10 +27,9 @@ jupyter notebook
 | Notebook               | Description                                    |
 |------------------------|------------------------------------------------|
 | `backend_call.ipynb`   | Test API calls to the backend service          |
-| `database.ipynb`       | Interact with the PostgreSQL database directly |
+| `database.ipynb`       | Interact with the PostgreSQL database directly, including vector storage (pgvector) |
 | `huggingface.ipynb`    | Experiment with Hugging Face models            |
 | `llama_cpp.ipynb`      | Test local LLM inference with llama-cpp        |
-| `qdrant.ipynb`         | Interact with the Qdrant vector database       |
 
 ## Structure
 
@@ -57,7 +56,7 @@ The environment includes 28+ packages covering:
 - **ML/AI**: PyTorch, TensorFlow, scikit-learn, transformers, llama-cpp-python, sentence-transformers, spaCy
 - **Data**: NumPy, Pandas, Matplotlib, Seaborn
 - **NLP**: LangChain, LangGraph, tiktoken
-- **Databases**: psycopg (PostgreSQL), qdrant-client, neo4j
+- **Databases**: psycopg + pgvector (PostgreSQL), neo4j
 - **Document Processing**: BeautifulSoup4, python-docx, PyPDF2, lxml
 - **Networking**: NetworkX, Pydantic, Requests
 

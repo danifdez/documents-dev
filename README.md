@@ -10,7 +10,7 @@ Development monorepo for the **Documents** platform — an intelligent document 
 |---------|-------------|-------------|
 | **Backend** | REST API and job orchestration | NestJS, TypeORM, PostgreSQL, Socket.io |
 | **Frontend** | Desktop application | Electron, Vue 3, Vite, Tailwind CSS |
-| **Models** | AI/ML processing workers | Python, Whisper, Mistral-7B, spaCy, Qdrant |
+| **Models** | AI/ML processing workers | Python, Whisper, Mistral-7B, spaCy, pgvector |
 
 ## Quick Start
 
@@ -41,7 +41,7 @@ See [docs/scripts.md](docs/scripts.md) for all available commands.
 
 ## Documentation
 
-- [Infrastructure](docs/infrastructure.md) — PostgreSQL and Qdrant configuration
+- [Infrastructure](docs/infrastructure.md) — PostgreSQL (with pgvector) configuration
 - [Docker Compose](docs/docker-compose.md) — Development and E2E compose files
 - [Playground](docs/playground.md) — Jupyter experimentation environment
 - [Scripts](docs/scripts.md) — `manage` script reference

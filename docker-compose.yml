@@ -1,6 +1,6 @@
 services:
   database:
-    image: postgres:17.6
+    image: pgvector/pgvector:pg17
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -9,15 +9,6 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-example}
       - POSTGRES_DB=${POSTGRES_DB:-documents}
-    restart: unless-stopped
-
-  qdrant:
-    image: qdrant/qdrant:v1.14.1
-    ports:
-      - "${QDRANT_PORT:-6333}:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
     restart: unless-stopped
 
   neo4j:
@@ -33,5 +24,4 @@ services:
 
 volumes:
   database-data:
-  qdrant_data:
   neo4j_data:

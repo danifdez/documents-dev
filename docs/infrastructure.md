@@ -1,10 +1,10 @@
 # Infrastructure Services
 
-The development environment relies on two infrastructure services managed via Docker Compose. Both run as standalone containers with persistent named volumes.
+The development environment relies on a single infrastructure service managed via Docker Compose. It runs as a standalone container with a persistent named volume.
 
-## PostgreSQL 17.6
+## PostgreSQL 17 (pgvector)
 
-Relational database used by the backend for document metadata, job queues, and application state.
+Relational database used by the backend for document metadata, job queues, and application state. The image is `pgvector/pgvector:pg17`, which bundles the `vector` (pgvector) extension used for storing and querying document embeddings — there is no separate vector database.
 
 |              | Development          | E2E Testing            |
 |--------------|----------------------|------------------------|
@@ -26,31 +26,17 @@ psql -h localhost -p 5432 -U postgres -d documents
 docker compose logs database
 ```
 
-## Qdrant v1.14.1
+## Vector Storage (pgvector)
 
-Vector database used for storing and querying document embeddings (semantic search).
+Document embeddings (semantic search and RAG) live in PostgreSQL via the `vector` (pgvector) extension — there is no separate vector service. Embeddings are E5 multilingual vectors (384 dimensions, cosine distance) stored across three tables, each scoped to a different domain for physical isolation:
 
-|              | Development          | E2E Testing            |
-|--------------|----------------------|------------------------|
-| **HTTP port**| 6333                 | 6334                   |
-| **gRPC port**| 6334                 | —                      |
-| **Volume**   | `qdrant_data`        | —                      |
+| Table | Scope |
+|-------|-------|
+| `rag_chunks` | Workspace RAG (resources, docs, knowledge) |
+| `indexed_file_chunks` | Files in the assistant's working folder |
+| `memory_vectors` | Assistant memory (1-to-1 with memory entries) |
 
-### Query Collections
-
-```bash
-curl http://localhost:6333/collections
-```
-
-### View Logs
-
-```bash
-docker compose logs qdrant
-```
-
-### Documentation
-
-See the [Qdrant official documentation](https://qdrant.tech/documentation/) for API details.
+The extension and the tables are created by a backend TypeORM migration (`CreateVectorTables`), following the migration-first schema rule. The models worker reads and writes these tables directly with `psycopg` and the `pgvector` package.
 
 ## Shared Document Storage
 
@@ -61,6 +47,5 @@ The `./documents/` directory at the repository root is mounted into both `backen
 | Volume          | Service    | Mount Point                    |
 |-----------------|------------|--------------------------------|
 | `database-data` | database   | `/var/lib/postgresql/data`     |
-| `qdrant_data`   | qdrant     | `/qdrant/storage`              |
 
 These volumes persist data across container restarts. To fully reset them, use the [reset script](scripts.md) or remove them manually with `docker volume rm`.

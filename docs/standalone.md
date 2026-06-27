@@ -30,12 +30,17 @@ selects standalone mode for the first time. No additional action is required.
 | Service | Approximate size | Source |
 |---------|-----------------|--------|
 | Backend (NestJS API) | ~50 MB | GitHub Releases |
-| PostgreSQL 17.6 | ~200 MB | repo1.maven.org (zonky binaries) |
-| Qdrant 1.14.1 | ~40 MB | github.com/qdrant/qdrant |
+| PostgreSQL 17.6 + pgvector | ~200 MB | GitHub Releases |
 | Neo4j 5 | ~60 MB | dist.neo4j.org |
 
-**Total: ~350 MB.** The download happens once and the files are stored in the
+**Total: ~310 MB.** The download happens once and the files are stored in the
 application's user-data directory.
+
+Document embeddings (semantic search / RAG) are stored in PostgreSQL via the
+`vector` (pgvector) extension — there is no separate vector service. The
+embedded PostgreSQL is the zonky binaries repackaged with pgvector baked in
+(`./build-release postgres`, which pulls the prebuilt extension `.deb` from the
+PostgreSQL APT repository), so the server has vector support out of the box.
 
 ## Optional AI Features
 
@@ -56,10 +61,10 @@ appropriate variant automatically.
 
 When a local workspace is started the services are launched in this order:
 
-1. **PostgreSQL** — relational database for application data (required).
-2. **Qdrant** — vector database for semantic search (started if installed).
-3. **Neo4j** — graph database for knowledge relationships (started if installed).
-4. **Backend** — REST API that connects the frontend to the databases.
+1. **PostgreSQL** — relational database for application data, including document
+   embeddings via pgvector (required).
+2. **Neo4j** — graph database for knowledge relationships (started if installed).
+3. **Backend** — REST API that connects the frontend to the databases.
 
 The application is ready when the backend reports that it is running. All services
 are stopped automatically when the application is closed.

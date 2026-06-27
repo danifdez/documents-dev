@@ -9,7 +9,6 @@ The `manage` script is the primary development tool for the repository. It handl
 - **Docker** and **Docker Compose** (v2 plugin or standalone `docker-compose`) — auto-detected
 - **Node.js** and **npm** — for backend and frontend
 - **Python 3** and `python3 -m venv` — for models and playground
-- `curl` — for Qdrant operations
 - `pg_dump` / `psql` — for `export` and `import` commands (must be available on the host)
 
 ### Commands
@@ -25,7 +24,7 @@ bash manage install
 Steps performed:
 
 1. Interactively configures `.env` files for the root, backend, models, and frontend
-2. Starts PostgreSQL and Qdrant via Docker Compose
+2. Starts PostgreSQL via Docker Compose and ensures the required extensions (`pg_trgm`, `unaccent`, `vector`)
 3. Runs backend database migrations and seeders
 4. Creates a Python virtual environment and installs dependencies for models
 5. Installs frontend npm dependencies
@@ -38,7 +37,7 @@ Starts all services using locally installed dependencies.
 bash manage start
 ```
 
-- Starts PostgreSQL and Qdrant (Docker)
+- Starts PostgreSQL (Docker)
 - Launches the backend (`npm run start:dev`) in the background
 - Launches the models worker (`python jobs.py`) in the background
 - Saves process IDs to `.pids` and rotates log files if they exceed 10 MB
@@ -71,11 +70,10 @@ bash manage reset --yes    # skips confirmation
 Actions performed:
 
 1. Stops all running services
-2. Drops all PostgreSQL tables (`DROP SCHEMA public CASCADE`)
+2. Drops all PostgreSQL tables (`DROP SCHEMA public CASCADE`) — this also removes the vector tables, which are recreated on re-migration
 3. Deletes all files in `./documents/`
-4. Deletes all Qdrant collections
-5. Removes the frontend user configuration (`~/.config/documents-frontend`)
-6. Re-runs database migrations
+4. Removes the frontend user configuration (`~/.config/documents-frontend`)
+5. Re-runs database migrations
 
 > **Destructive operation** — use with care.
 

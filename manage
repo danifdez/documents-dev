@@ -48,10 +48,6 @@ setup_env_root() {
   ask "PostgreSQL user" "postgres";             local PG_USER="$REPLY"
   ask "PostgreSQL password" "example";          local PG_PASS="$REPLY"
 
-  local QD_HOST="localhost" QD_PORT="6333"
-  ask "Qdrant host" "localhost";                QD_HOST="$REPLY"
-  ask "Qdrant port" "6333";                     QD_PORT="$REPLY"
-
   cat > "$ENV_FILE" <<EOF
 # Database
 POSTGRES_HOST=$PG_HOST
@@ -59,10 +55,6 @@ POSTGRES_PORT=$PG_PORT
 POSTGRES_DB=$PG_DB
 POSTGRES_USER=$PG_USER
 POSTGRES_PASSWORD=$PG_PASS
-
-# Qdrant
-QDRANT_HOST=$QD_HOST
-QDRANT_PORT=$QD_PORT
 EOF
   ok "Created .env"
 }
@@ -71,7 +63,7 @@ EOF
 # enabled. This is where the "everything on by default" policy lives: the
 # per-service `install` scripts stay fully interactive when run on their own, but
 # under `manage install` we write their config up front so they detect it and
-# skip their prompts. DB/Qdrant values come from the root .env (already loaded).
+# skip their prompts. DB values come from the root .env (already loaded).
 setup_service_envs() {
   # Backend: the example already has every FEATURE_* = true; just patch the DB.
   local be="$ROOT_DIR/backend/.env"
@@ -98,7 +90,8 @@ setup_service_envs() {
     ok "Created frontend/.env"
   fi
 
-  # Models: config.json from defaults (Qdrant on), patched with DB + Qdrant.
+  # Models: config.json from defaults, patched with the DB connection. Vectors
+  # live in Postgres (pgvector), so no separate vector-store config is needed.
   local mcfg="$ROOT_DIR/models/config/config.json"
   if [ -f "$mcfg" ]; then
     ok "models/config/config.json already exists (skipping)"
@@ -106,8 +99,7 @@ setup_service_envs() {
     mkdir -p "$ROOT_DIR/models/config/tasks"
     POSTGRES_HOST="${POSTGRES_HOST:-localhost}" POSTGRES_PORT="${POSTGRES_PORT:-5432}" \
     POSTGRES_DB="${POSTGRES_DB:-documents}" POSTGRES_USER="${POSTGRES_USER:-postgres}" \
-    POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-example}" QDRANT_HOST="${QDRANT_HOST:-localhost}" \
-    QDRANT_PORT="${QDRANT_PORT:-6333}" python3 - "$ROOT_DIR/models" <<'PY'
+    POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-example}" python3 - "$ROOT_DIR/models" <<'PY'
 import json, os, shutil, sys
 root = sys.argv[1]
 cfg = json.load(open(os.path.join(root, 'common/config.default.json')))
@@ -117,11 +109,6 @@ cfg['database'].update({
     'name': os.environ['POSTGRES_DB'],
     'user': os.environ['POSTGRES_USER'],
     'password': os.environ['POSTGRES_PASSWORD'],
-})
-cfg['qdrant'].update({
-    'enabled': True,
-    'host': os.environ['QDRANT_HOST'],
-    'port': int(os.environ['QDRANT_PORT']),
 })
 with open(os.path.join(root, 'config/config.json'), 'w') as f:
     json.dump(cfg, f, indent=2)
@@ -143,18 +130,6 @@ load_env() {
   fi
 }
 
-# ── Check if RAG feature is enabled ──────────────────────────
-is_rag_enabled() {
-  local backend_env="$ROOT_DIR/backend/.env"
-  if [ -f "$backend_env" ]; then
-    local val
-    val=$(grep -E '^FEATURE_RAG=' "$backend_env" 2>/dev/null | cut -d= -f2)
-    [ "$val" != "false" ]
-  else
-    return 0  # Default: enabled
-  fi
-}
-
 # ── Check if Relationships feature is enabled ────────────────
 is_relationships_enabled() {
   local backend_env="$ROOT_DIR/backend/.env"
@@ -170,7 +145,6 @@ is_relationships_enabled() {
 # Returns the docker compose services to start based on enabled features
 get_compose_services() {
   local services=("database")
-  is_rag_enabled && services+=("qdrant")
   is_relationships_enabled && services+=("neo4j")
   echo "${services[@]}"
 }
@@ -313,8 +287,8 @@ ensure_profiles_initialized() {
     rmdir "$ROOT_DIR/documents" 2>/dev/null || rm -rf "$ROOT_DIR/documents"
   fi
 
-  # Stop any containers left from the pre-profile layout (container_name: database/qdrant/neo4j)
-  for c in database qdrant neo4j; do
+  # Stop any containers left from the pre-profile layout (container_name: database/neo4j)
+  for c in database neo4j; do
     if docker ps -a --format '{{.Names}}' | grep -qx "$c"; then
       info "  Removing legacy container: $c"
       docker rm -f "$c" >/dev/null 2>&1 || true
@@ -322,7 +296,7 @@ ensure_profiles_initialized() {
   done
 
   # Rename legacy volumes (documents-dev_*) to the new profile-scoped names
-  for suffix in database-data qdrant_data neo4j_data; do
+  for suffix in database-data neo4j_data; do
     local legacy="documents-dev_${suffix}"
     local target="$(profile_volume_name default "$suffix")"
     if docker volume inspect "$legacy" >/dev/null 2>&1 && ! docker volume inspect "$target" >/dev/null 2>&1; then
@@ -476,8 +450,8 @@ wait_for_postgres() {
 # ── Ensure PostgreSQL extensions ───────────────────────────────────
 ensure_pg_extensions() {
   info "Ensuring PostgreSQL extensions..."
-  $COMPOSE_CMD exec -T database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent;" >/dev/null 2>&1
-  ok "PostgreSQL extensions ready (pg_trgm, unaccent)"
+  $COMPOSE_CMD exec -T database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent; CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null 2>&1
+  ok "PostgreSQL extensions ready (pg_trgm, unaccent, vector)"
 }
 
 # ── Initialize DB: migrations (for a fresh profile) ──────────────
@@ -532,7 +506,7 @@ cmd_install() {
   export_compose_project
   ok "documents/ symlink points to profile: $(get_active_profile)"
 
-  # ── Start infrastructure (database + conditionally qdrant) ──
+  # ── Start infrastructure (database) ──
   info "Starting infrastructure containers..."
   $COMPOSE_CMD up -d database
   wait_for_postgres 30
@@ -543,15 +517,6 @@ cmd_install() {
   cd "$ROOT_DIR/backend"
   bash install
   cd "$ROOT_DIR"
-
-  # Start Qdrant only if RAG is enabled (checked after backend .env is created)
-  if is_rag_enabled; then
-    info "RAG enabled – starting Qdrant..."
-    $COMPOSE_CMD up -d qdrant
-    ok "Qdrant started"
-  else
-    info "RAG disabled – skipping Qdrant"
-  fi
 
   # Start Neo4j only if Relationships is enabled
   if is_relationships_enabled; then
@@ -738,7 +703,7 @@ stop_docker_service() {
 
 is_known_component() {
   case "$1" in
-    backend|models|voice|database|qdrant|neo4j) return 0 ;;
+    backend|models|voice|database|neo4j) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -760,9 +725,6 @@ print_start_summary() {
     echo "  Voice worker:   running                (PID: $VOICE_PID)"
   fi
   echo "  PostgreSQL:     localhost:5432"
-  if is_rag_enabled; then
-    echo "  Qdrant:         http://localhost:6333"
-  fi
   if is_relationships_enabled; then
     echo "  Neo4j:          http://localhost:7474"
   fi
@@ -785,13 +747,12 @@ cmd_start() {
   # Per-component start
   if [ $# -gt 0 ]; then
     for component in "$@"; do
-      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database, qdrant, neo4j)"
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database, neo4j)"
     done
     for component in "$@"; do
       case "$component" in
         backend)
           start_docker_service database
-          if is_rag_enabled; then start_docker_service qdrant; fi
           if is_relationships_enabled; then start_docker_service neo4j; fi
           ensure_log_watchdog
           start_backend
@@ -804,7 +765,7 @@ cmd_start() {
           ensure_log_watchdog
           start_voice_worker
           ;;
-        database|qdrant|neo4j)
+        database|neo4j)
           start_docker_service "$component"
           ;;
       esac
@@ -855,14 +816,14 @@ cmd_stop() {
   # Per-component stop (don't tear down docker infra unless explicitly named)
   if [ $# -gt 0 ]; then
     for component in "$@"; do
-      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database, qdrant, neo4j)"
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database, neo4j)"
     done
     for component in "$@"; do
       case "$component" in
         backend) stop_backend ;;
         models)  stop_models ;;
         voice)   stop_voice_worker ;;
-        database|qdrant|neo4j) stop_docker_service "$component" ;;
+        database|neo4j) stop_docker_service "$component" ;;
       esac
     done
     echo ""
@@ -904,7 +865,7 @@ cmd_stop() {
     ok "Killed process(es) on port 3000"
   fi
 
-  info "Stopping database and qdrant..."
+  info "Stopping infrastructure containers..."
   $COMPOSE_CMD down
   ok "Infrastructure stopped"
 
@@ -925,7 +886,7 @@ cmd_reset() {
   done
 
   if [ "$YES" -ne 1 ]; then
-    echo "This will PERMANENTLY DELETE project data (documents, DB tables, Qdrant collections, frontend settings)."
+    echo "This will PERMANENTLY DELETE project data (documents, DB tables, frontend settings)."
     read -p "Type RESET to continue: " confirm
     if [ "$confirm" != "RESET" ]; then
       echo "Aborted."
@@ -943,7 +904,7 @@ cmd_reset() {
   cmd_stop 2>/dev/null || true
 
   # ── Start infrastructure ──
-  echo "-- Starting database and qdrant containers"
+  echo "-- Starting database container"
   $COMPOSE_CMD up -d
   wait_for_postgres 30
 
@@ -969,21 +930,8 @@ cmd_reset() {
     warn "DOCUMENTS_ARCHIVE_DIR is set to an external path; files at '$DOCUMENTS_ARCHIVE_DIR' were NOT removed."
   fi
 
-  # ── Clear Qdrant ──
-  echo "-- Clearing all Qdrant collections"
-  if command -v curl >/dev/null 2>&1; then
-    collections_json="$(curl -sS http://localhost:6333/collections || echo '')"
-    if [ -n "$collections_json" ]; then
-      names=$(printf "%s" "$collections_json" | python3 -c 'import sys,json; r=json.load(sys.stdin); print("\n".join([c["name"] for c in r.get("collections",[])]))' 2>/dev/null || true)
-      if [ -n "$names" ]; then
-        while IFS= read -r name; do
-          [ -z "$name" ] && continue
-          echo "Deleting collection: $name"
-          curl -sS -X DELETE "http://localhost:6333/collections/$name" || true
-        done <<< "$names"
-      fi
-    fi
-  fi
+  # (Vector tables live in Postgres and were dropped with the schema above;
+  # the CreateVectorTables migration recreates them empty.)
 
   # ── Remove frontend settings ──
   echo "-- Removing frontend user settings"
@@ -1288,9 +1236,9 @@ cmd_profile_list() {
   active="$(get_active_profile)"
 
   printf "${BOLD}Profiles${NC}\n"
-  printf "  %-2s %-20s %-10s %-10s %-10s %s\n" "" "NAME" "POSTGRES" "QDRANT" "NEO4J" "CREATED"
-  printf "  %-2s %-20s %-10s %-10s %-10s %s\n" "" "----" "--------" "------" "-----" "-------"
-  local p name created pg qd neo mark
+  printf "  %-2s %-20s %-10s %-10s %s\n" "" "NAME" "POSTGRES" "NEO4J" "CREATED"
+  printf "  %-2s %-20s %-10s %-10s %s\n" "" "----" "--------" "-----" "-------"
+  local p name created pg neo mark
   for p in "$PROFILES_DIR"/*/; do
     [ -d "$p" ] || continue
     name="$(basename "$p")"
@@ -1298,11 +1246,10 @@ cmd_profile_list() {
     [ -f "$p/metadata.json" ] || continue
     created="$(grep -oE '"created_at"[[:space:]]*:[[:space:]]*"[^"]+"' "$p/metadata.json" | head -1 | cut -d'"' -f4 || echo "?")"
     pg="$(volume_size_human "$(profile_volume_name "$name" database-data)")"
-    qd="$(volume_size_human "$(profile_volume_name "$name" qdrant_data)")"
     neo="$(volume_size_human "$(profile_volume_name "$name" neo4j_data)")"
     mark=" "
     [ "$name" = "$active" ] && mark="*"
-    printf "  ${GREEN}%-2s${NC} %-20s %-10s %-10s %-10s %s\n" "$mark" "$name" "$pg" "$qd" "$neo" "$created"
+    printf "  ${GREEN}%-2s${NC} %-20s %-10s %-10s %s\n" "$mark" "$name" "$pg" "$neo" "$created"
   done
 
   # Archived profiles
@@ -1372,7 +1319,7 @@ cmd_profile_create() {
       warn "  DOCUMENTS_ARCHIVE_DIR is set to an external path; archived files for '$src' are NOT cloned."
     fi
     # Clone volumes
-    for suffix in database-data qdrant_data neo4j_data; do
+    for suffix in database-data neo4j_data; do
       local src_vol dst_vol
       src_vol="$(profile_volume_name "$src" "$suffix")"
       dst_vol="$(profile_volume_name "$name" "$suffix")"
@@ -1471,7 +1418,7 @@ cmd_profile_delete() {
     [ "$confirm" = "DELETE" ] || { echo "Aborted."; exit 1; }
   fi
 
-  for suffix in database-data qdrant_data neo4j_data; do
+  for suffix in database-data neo4j_data; do
     local vol
     vol="$(profile_volume_name "$name" "$suffix")"
     if docker volume inspect "$vol" >/dev/null 2>&1; then
@@ -1499,7 +1446,7 @@ cmd_profile_rename() {
 
   info "Renaming profile: $old -> $new"
   # Rename volumes (must be done by create+copy+delete)
-  for suffix in database-data qdrant_data neo4j_data; do
+  for suffix in database-data neo4j_data; do
     local src_vol dst_vol
     src_vol="$(profile_volume_name "$old" "$suffix")"
     dst_vol="$(profile_volume_name "$new" "$suffix")"
@@ -1551,7 +1498,7 @@ cmd_profile_archive() {
   fi
   cp "$PROFILES_DIR/$name/metadata.json" "$TMPDIR/metadata.json" 2>/dev/null || true
 
-  for suffix in database-data qdrant_data neo4j_data; do
+  for suffix in database-data neo4j_data; do
     local vol
     vol="$(profile_volume_name "$name" "$suffix")"
     if docker volume inspect "$vol" >/dev/null 2>&1; then
@@ -1566,7 +1513,7 @@ cmd_profile_archive() {
   tar -czf "$out" -C "$TMPDIR" .
 
   # Remove live profile state
-  for suffix in database-data qdrant_data neo4j_data; do
+  for suffix in database-data neo4j_data; do
     local vol
     vol="$(profile_volume_name "$name" "$suffix")"
     docker volume rm "$vol" >/dev/null 2>&1 || true
@@ -1612,7 +1559,7 @@ cmd_profile_restore() {
 METAEOF
   fi
 
-  for suffix in database-data qdrant_data neo4j_data; do
+  for suffix in database-data neo4j_data; do
     if [ -f "$TMPDIR/${suffix}.tar" ]; then
       local vol
       vol="$(profile_volume_name "$name" "$suffix")"
@@ -1635,24 +1582,24 @@ Usage: $0 <command> [options]
 Commands:
   install                 Set up the development environment:
                           - Download git submodules
-                          - Configure root .env (database + qdrant)
-                          - Start PostgreSQL + Qdrant (Docker)
+                          - Configure root .env (database)
+                          - Start PostgreSQL (Docker)
                           - Run each submodule's install.sh
 
   start [components...]   Start services. With no args, starts everything:
-                          - PostgreSQL + Qdrant (Docker)
+                          - PostgreSQL (Docker)
                           - Backend (local, npm run start:dev)
                           - Models (local, python jobs.py in .venv)
                           With component names, only those are started:
                             ./manage start backend
                             ./manage start models database
-                          Valid components: backend, models, database, qdrant, neo4j.
+                          Valid components: backend, models, database, neo4j.
 
   stop [components...]    Stop services. With no args, stops everything (incl. docker).
                           With component names, only those are stopped (docker
                           infra stays up unless explicitly named):
                             ./manage stop backend
-                            ./manage stop models qdrant
+                            ./manage stop models database
 
   reset [--yes]           Permanently delete all project data and re-initialize.
                           --yes  Skip confirmation prompt

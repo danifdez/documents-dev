@@ -6,7 +6,7 @@ scikit-learn
 torch
 tensorflow
 psycopg[binary]
-qdrant-client
+pgvector
 transformers
 llama-cpp-python
 sentence-transformers

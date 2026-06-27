@@ -21,6 +21,8 @@ step()  { printf "\n${BOLD}${CYAN}── %s ──${NC}\n" "$*"; }
 
 APP_VERSION="1.0.0"
 RELEASE_DIR="$ROOT_DIR/release-assets"
+# Embedded PostgreSQL version (zonky binaries) we repackage with pgvector.
+POSTGRES_VERSION="17.6.0"
 
 # ── Detect platform and architecture ──
 detect_platform() {
@@ -109,6 +111,72 @@ build_backend() {
   rm -rf "$ROOT_DIR/.build-staging/backend"
   ok "Backend asset: $RELEASE_DIR/${name}.$(archive_ext) ($(du -sh "$RELEASE_DIR/${name}."* | cut -f1))"
   cd "$ROOT_DIR"
+}
+
+# ════════════════════════════════════════════════════════════════════
+# BUILD POSTGRESQL + PGVECTOR ASSET
+# ════════════════════════════════════════════════════════════════════
+# Repackages the zonky embedded PostgreSQL binaries with the pgvector extension
+# baked in, so the standalone app installs a vector-capable server out of the
+# box (the embedded server ships no compiler). The prebuilt pgvector files come
+# from the official PostgreSQL APT repository (.deb) — no docker, no compiler.
+build_postgres() {
+  step "Building PostgreSQL + pgvector asset"
+
+  local jarPlatform debArch
+  case "$PLATFORM" in
+    linux-x64)   jarPlatform="linux-amd64";   debArch="amd64" ;;
+    linux-arm64) jarPlatform="linux-arm64v8"; debArch="arm64" ;;
+    *) fail "postgres build currently supports linux only (got $PLATFORM)." ;;
+  esac
+  command -v unzip    >/dev/null 2>&1 || fail "unzip is required to unpack the zonky jar."
+  command -v dpkg-deb >/dev/null 2>&1 || fail "dpkg-deb is required to unpack the pgvector .deb (Debian/Ubuntu)."
+
+  local staging="$ROOT_DIR/.build-staging/postgres"
+  rm -rf "$staging"; mkdir -p "$staging"
+
+  # 1. Download + unpack the zonky embedded PostgreSQL binaries (jar → .txz → tree).
+  local jar="$ROOT_DIR/.build-staging/pg.jar"
+  local url="https://repo1.maven.org/maven2/io/zonky/test/postgres/embedded-postgres-binaries-${jarPlatform}/${POSTGRES_VERSION}/embedded-postgres-binaries-${jarPlatform}-${POSTGRES_VERSION}.jar"
+  info "Downloading zonky PostgreSQL ${POSTGRES_VERSION} ($jarPlatform)..."
+  curl -fSL "$url" -o "$jar"
+  ( cd "$staging" && unzip -qo "$jar" )
+  rm -f "$jar"
+  local txz
+  txz="$(find "$staging" -maxdepth 1 -name '*.txz' | head -1)"
+  [ -n "$txz" ] || fail "zonky jar did not contain a .txz payload"
+  tar xf "$txz" -C "$staging"
+  rm -f "$txz"
+  rm -rf "$staging/META-INF"
+
+  # 2. Fetch the prebuilt pgvector for PostgreSQL 17 from the PGDG APT pool. The
+  # pgdg12 (Debian 12) build is glibc-portable and matches the zonky pg17 ABI.
+  local pool="https://apt.postgresql.org/pub/repos/apt/pool/main/p/pgvector/"
+  local deb
+  deb="$(curl -fsSL "$pool" | grep -oE "postgresql-17-pgvector_[0-9.]+-[0-9]+\.pgdg12\+1_${debArch}\.deb" | sort -V | tail -1)"
+  [ -n "$deb" ] || fail "no postgresql-17-pgvector .deb found for $debArch in the PGDG pool"
+  info "Fetching pgvector: $deb"
+  local pgtmp="$ROOT_DIR/.build-staging/pgvector-files"
+  rm -rf "$pgtmp"; mkdir -p "$pgtmp"
+  curl -fsSL "${pool}${deb}" -o "$pgtmp/pgvector.deb"
+  dpkg-deb -x "$pgtmp/pgvector.deb" "$pgtmp/x"
+
+  # 3. Drop pgvector into the extracted server (detect the real lib/extension dirs).
+  local pkglib extdir
+  pkglib="$(dirname "$(find "$staging" -name 'plpgsql.so' | head -1)")"
+  extdir="$(dirname "$(find "$staging" -name 'plpgsql.control' | head -1)")"
+  [ -n "$pkglib" ] && [ -n "$extdir" ] || fail "could not locate the server's lib/extension dirs"
+  cp "$pgtmp/x/usr/lib/postgresql/17/lib/vector.so" "$pkglib/"
+  cp "$pgtmp/x/usr/share/postgresql/17/extension/vector.control" "$extdir/"
+  cp "$pgtmp/x/usr/share/postgresql/17/extension"/vector--*.sql "$extdir/"
+  rm -rf "$pgtmp"
+
+  # 4. Package (bin/lib/share at the archive root, like the app expects).
+  mkdir -p "$RELEASE_DIR"
+  local name="documents-postgres-v${APP_VERSION}-${PLATFORM}"
+  ( cd "$staging" && tar czf "$RELEASE_DIR/${name}.tar.gz" . )
+  rm -rf "$staging"
+  ok "PostgreSQL+pgvector asset: $RELEASE_DIR/${name}.tar.gz ($(du -sh "$RELEASE_DIR/${name}.tar.gz" | cut -f1))"
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -290,8 +358,8 @@ show_help() {
 ${BOLD}Documents Build${NC}
 
 Builds the Electron installer and the release assets for standalone mode.
-Databases (PostgreSQL, Qdrant, Neo4j) are downloaded by the app directly
-from their official sources — they are NOT packaged here.
+PostgreSQL is repackaged here with pgvector baked in; Neo4j is downloaded by
+the app directly from its official source.
 
 ${BOLD}Usage:${NC}
   ./build-release [command]
@@ -300,6 +368,7 @@ ${BOLD}Commands:${NC}
   ${GREEN}all${NC}             Build backend asset + Electron installer
   ${GREEN}installer${NC}       Build only the Electron app installer (~150 MB)
   ${GREEN}backend${NC}         Build the backend release asset (~50 MB)
+  ${GREEN}postgres${NC}        Build the PostgreSQL + pgvector asset (~200 MB; needs dpkg-deb)
   ${GREEN}models-cpu${NC}      Build the models service for CPU (~2 GB)
   ${GREEN}models-gpu${NC}      Build the models service for GPU/CUDA (~5 GB)
   ${GREEN}models-all${NC}      Build both CPU and GPU variants
@@ -310,10 +379,11 @@ ${BOLD}Commands:${NC}
 
 ${BOLD}Test standalone locally (without GitHub):${NC}
   1. ./build-release backend           # ~50 MB, quick
-  2. ./build-release models-cpu         # ~2 GB, slow (downloads deps)
-  3. ./build-release serve              # serves release-assets/ on :8000
-  4. cd frontend && DOCUMENTS_RELEASE_BASE_URL=http://localhost:8000 npm start
-     (DBs still come from their official sources — needs internet)
+  2. ./build-release postgres           # ~200 MB; needs dpkg-deb (Debian/Ubuntu)
+  3. ./build-release models-cpu         # ~2 GB, slow (downloads deps)
+  4. ./build-release serve              # serves release-assets/ on :8000
+  5. cd frontend && DOCUMENTS_RELEASE_BASE_URL=http://localhost:8000 npm start
+     (Neo4j still comes from its official source — needs internet)
 
 ${BOLD}Covering "any machine":${NC}
   Each models variant builds in its own venv with its own deps (CPU vs CUDA).
@@ -329,12 +399,11 @@ ${BOLD}Workflow:${NC}
   4. Distribute the installer
 
 ${BOLD}What the app downloads at runtime (from official sources):${NC}
-  PostgreSQL     ~200 MB   from repo1.maven.org (zonky binaries)
-  Qdrant         ~40 MB    from github.com/qdrant/qdrant/releases
   Neo4j          ~60 MB    from dist.neo4j.org
 
 ${BOLD}What we host on GitHub Releases:${NC}
   Backend        ~50 MB    compiled NestJS + node_modules
+  PostgreSQL     ~200 MB   zonky binaries repackaged with pgvector
   Models (CPU)   ~2 GB     PyInstaller bundle (optional)
   Models (GPU)   ~5 GB     PyInstaller bundle with CUDA (optional)
 
@@ -368,6 +437,7 @@ case "$COMMAND" in
     ;;
   installer)    build_installer ;;
   backend)      build_backend ;;
+  postgres)     build_postgres ;;
   models-cpu)   build_models cpu ;;
   models-gpu)   build_models gpu ;;
   models-all)   build_models cpu; build_models gpu ;;

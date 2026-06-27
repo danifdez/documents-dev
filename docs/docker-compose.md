@@ -10,20 +10,18 @@ Starts the infrastructure dependencies shared by all application services.
 
 | Service | Image | Port(s) | Description |
 |---------|-------|---------|-------------|
-| `database` | `postgres:17.6` | 5432 | PostgreSQL relational database |
-| `qdrant` | `qdrant/qdrant:v1.14.1` | 6333, 6334 | Vector database for embeddings |
+| `database` | `pgvector/pgvector:pg17` | 5432 | PostgreSQL with the `vector` (pgvector) extension; also stores document embeddings |
 
 ### Volumes
 
 | Volume | Service | Mount |
 |--------|---------|-------|
 | `database-data` | database | `/var/lib/postgresql/data` |
-| `qdrant_data` | qdrant | `/qdrant/storage` |
 
-Volumes persist data across container restarts. To remove them manually:
+The volume persists data across container restarts. To remove it manually:
 
 ```bash
-docker volume rm documents_database-data documents_qdrant_data
+docker volume rm documents_database-data
 ```
 
 ### Usage
@@ -34,7 +32,6 @@ The `manage start` command starts the infrastructure automatically. To manage it
 docker compose up -d         # start in the background
 docker compose down          # stop containers (volumes are preserved)
 docker compose logs database
-docker compose logs qdrant
 ```
 
 ## E2E Testing (`docker-compose.e2e.yml`)
@@ -45,8 +42,7 @@ Launches an isolated environment for end-to-end tests using separate ports to av
 
 | Service | Port(s) | Notes |
 |---------|---------|-------|
-| `database-e2e` | 5433 | PostgreSQL, database `documents_e2e` |
-| `qdrant-e2e` | 6334 | Qdrant vector database |
+| `database-e2e` | 5433 | PostgreSQL (pgvector), database `documents_e2e` |
 | `backend-e2e` | 3000, 9229 | Built from `backend/Dockerfile` |
 | `models-e2e` | — | Built from `models/Dockerfile` |
 | `frontend-e2e` | — | Runs the E2E test suite (`tests/Dockerfile`) |
