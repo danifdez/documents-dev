@@ -480,7 +480,7 @@ ensure_pg_extensions() {
   ok "PostgreSQL extensions ready (pg_trgm, unaccent)"
 }
 
-# ── Initialize DB: migrations + features (for a fresh profile) ────
+# ── Initialize DB: migrations (for a fresh profile) ──────────────
 init_db() {
   local profile="${1:-$(get_active_profile)}"
   info "Initializing database for profile '$profile'..."
@@ -494,17 +494,6 @@ init_db() {
   info "Running migrations..."
   (cd "$ROOT_DIR/backend" && npm run migration:run 2>&1 | grep -E "successfully|failed|Error") || fail "Migrations failed."
   ok "Migrations complete"
-
-  info "Installing features..."
-  local db_container
-  db_container="$(profile_project_name "$profile")-database-1"
-  for feature in authors bibliography calendar canvas datasets data-sources entities knowledge_base notes tasks timelines; do
-    local sql_file="$ROOT_DIR/backend/features/$feature/install.sql"
-    if [ -f "$sql_file" ]; then
-      docker exec -i "$db_container" psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" < "$sql_file" > /dev/null 2>&1 || warn "Feature '$feature' had warnings (usually safe to ignore)"
-    fi
-  done
-  ok "Features installed"
 
   export COMPOSE_PROJECT_NAME="$prev_project"
 }
@@ -1007,10 +996,6 @@ cmd_reset() {
   echo "-- Running migrations"
   cd "$ROOT_DIR/backend"
   npm run migration:run
-
-  # ── Install features ──
-  echo "-- Installing features"
-  npm run feature:install
   cd "$ROOT_DIR"
 
   echo "==> Reset completed successfully"
