@@ -130,23 +130,10 @@ load_env() {
   fi
 }
 
-# ── Check if Relationships feature is enabled ────────────────
-is_relationships_enabled() {
-  local backend_env="$ROOT_DIR/backend/.env"
-  if [ -f "$backend_env" ]; then
-    local val
-    val=$(grep -E '^FEATURE_RELATIONSHIPS=' "$backend_env" 2>/dev/null | cut -d= -f2)
-    [ "$val" != "false" ]
-  else
-    return 0  # Default: enabled
-  fi
-}
-
-# Returns the docker compose services to start based on enabled features
+# Returns the docker compose services to start. The graph (Apache AGE) now lives
+# inside PostgreSQL, so the database is the only infra service.
 get_compose_services() {
-  local services=("database")
-  is_relationships_enabled && services+=("neo4j")
-  echo "${services[@]}"
+  echo "database"
 }
 
 # ── Data profiles (versioned DB + documents) ────────────────────────
@@ -450,8 +437,8 @@ wait_for_postgres() {
 # ── Ensure PostgreSQL extensions ───────────────────────────────────
 ensure_pg_extensions() {
   info "Ensuring PostgreSQL extensions..."
-  $COMPOSE_CMD exec -T database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent; CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null 2>&1
-  ok "PostgreSQL extensions ready (pg_trgm, unaccent, vector)"
+  $COMPOSE_CMD exec -T database psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-documents}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS unaccent; CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS age;" >/dev/null 2>&1
+  ok "PostgreSQL extensions ready (pg_trgm, unaccent, vector, age)"
 }
 
 # ── Initialize DB: migrations (for a fresh profile) ──────────────
@@ -517,15 +504,6 @@ cmd_install() {
   cd "$ROOT_DIR/backend"
   bash install
   cd "$ROOT_DIR"
-
-  # Start Neo4j only if Relationships is enabled
-  if is_relationships_enabled; then
-    info "Relationships enabled – starting Neo4j..."
-    $COMPOSE_CMD up -d neo4j
-    ok "Neo4j started"
-  else
-    info "Relationships disabled – skipping Neo4j"
-  fi
 
   info "Installing models service..."
   cd "$ROOT_DIR/models"
@@ -703,7 +681,7 @@ stop_docker_service() {
 
 is_known_component() {
   case "$1" in
-    backend|models|voice|database|neo4j) return 0 ;;
+    backend|models|voice|database) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -725,9 +703,6 @@ print_start_summary() {
     echo "  Voice worker:   running                (PID: $VOICE_PID)"
   fi
   echo "  PostgreSQL:     localhost:5432"
-  if is_relationships_enabled; then
-    echo "  Neo4j:          http://localhost:7474"
-  fi
   echo ""
   echo "  Logs:"
   echo "    Backend:      tail -f .backend.log"
@@ -747,13 +722,12 @@ cmd_start() {
   # Per-component start
   if [ $# -gt 0 ]; then
     for component in "$@"; do
-      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database, neo4j)"
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database)"
     done
     for component in "$@"; do
       case "$component" in
         backend)
           start_docker_service database
-          if is_relationships_enabled; then start_docker_service neo4j; fi
           ensure_log_watchdog
           start_backend
           ;;
@@ -765,7 +739,7 @@ cmd_start() {
           ensure_log_watchdog
           start_voice_worker
           ;;
-        database|neo4j)
+        database)
           start_docker_service "$component"
           ;;
       esac
@@ -816,14 +790,14 @@ cmd_stop() {
   # Per-component stop (don't tear down docker infra unless explicitly named)
   if [ $# -gt 0 ]; then
     for component in "$@"; do
-      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database, neo4j)"
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database)"
     done
     for component in "$@"; do
       case "$component" in
         backend) stop_backend ;;
         models)  stop_models ;;
         voice)   stop_voice_worker ;;
-        database|neo4j) stop_docker_service "$component" ;;
+        database) stop_docker_service "$component" ;;
       esac
     done
     echo ""
@@ -1236,9 +1210,9 @@ cmd_profile_list() {
   active="$(get_active_profile)"
 
   printf "${BOLD}Profiles${NC}\n"
-  printf "  %-2s %-20s %-10s %-10s %s\n" "" "NAME" "POSTGRES" "NEO4J" "CREATED"
-  printf "  %-2s %-20s %-10s %-10s %s\n" "" "----" "--------" "-----" "-------"
-  local p name created pg neo mark
+  printf "  %-2s %-20s %-10s %s\n" "" "NAME" "POSTGRES" "CREATED"
+  printf "  %-2s %-20s %-10s %s\n" "" "----" "--------" "-------"
+  local p name created pg mark
   for p in "$PROFILES_DIR"/*/; do
     [ -d "$p" ] || continue
     name="$(basename "$p")"
@@ -1246,10 +1220,9 @@ cmd_profile_list() {
     [ -f "$p/metadata.json" ] || continue
     created="$(grep -oE '"created_at"[[:space:]]*:[[:space:]]*"[^"]+"' "$p/metadata.json" | head -1 | cut -d'"' -f4 || echo "?")"
     pg="$(volume_size_human "$(profile_volume_name "$name" database-data)")"
-    neo="$(volume_size_human "$(profile_volume_name "$name" neo4j_data)")"
     mark=" "
     [ "$name" = "$active" ] && mark="*"
-    printf "  ${GREEN}%-2s${NC} %-20s %-10s %-10s %s\n" "$mark" "$name" "$pg" "$neo" "$created"
+    printf "  ${GREEN}%-2s${NC} %-20s %-10s %s\n" "$mark" "$name" "$pg" "$created"
   done
 
   # Archived profiles
@@ -1593,7 +1566,7 @@ Commands:
                           With component names, only those are started:
                             ./manage start backend
                             ./manage start models database
-                          Valid components: backend, models, database, neo4j.
+                          Valid components: backend, models, database.
 
   stop [components...]    Stop services. With no args, stops everything (incl. docker).
                           With component names, only those are stopped (docker

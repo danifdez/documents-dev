@@ -171,6 +171,25 @@ build_postgres() {
   cp "$pgtmp/x/usr/share/postgresql/17/extension"/vector--*.sql "$extdir/"
   rm -rf "$pgtmp"
 
+  # 3b. Drop Apache AGE (entity graph + GraphRAG) into the same server. Unlike
+  # pgvector, AGE ships no .deb in the PGDG pool, so its artifacts must be built
+  # from source against PG17 (see docker/database/Dockerfile, which compiles the
+  # pinned AGE tag) and the resulting age.so / age.control / age--*.sql placed in
+  # a directory pointed to by AGE_ARTIFACTS_DIR (layout: lib/age.so plus
+  # extension/age.control + extension/age--*.sql). When that's not provided we
+  # still ship a working vector-only server, but WARN loudly: the relationships
+  # feature (and GraphRAG) won't work in standalone until AGE is bundled.
+  local agedir="${AGE_ARTIFACTS_DIR:-}"
+  if [ -n "$agedir" ] && [ -f "$agedir/lib/age.so" ]; then
+    cp "$agedir/lib/age.so" "$pkglib/"
+    cp "$agedir/extension/age.control" "$extdir/"
+    cp "$agedir/extension"/age--*.sql "$extdir/"
+    ok "Apache AGE bundled into the embedded PostgreSQL"
+  else
+    warn "Apache AGE artifacts not found (set AGE_ARTIFACTS_DIR to a dir with lib/age.so + extension/age.*)."
+    warn "Shipping a vector-only server: the relationships feature / GraphRAG will be unavailable in standalone."
+  fi
+
   # 4. Package (bin/lib/share at the archive root, like the app expects).
   mkdir -p "$RELEASE_DIR"
   local name="documents-postgres-v${APP_VERSION}-${PLATFORM}"
@@ -358,8 +377,10 @@ show_help() {
 ${BOLD}Documents Build${NC}
 
 Builds the Electron installer and the release assets for standalone mode.
-PostgreSQL is repackaged here with pgvector baked in; Neo4j is downloaded by
-the app directly from its official source.
+PostgreSQL is repackaged here with pgvector and Apache AGE baked in, so the
+embedded server provides both semantic search and the entity graph (GraphRAG)
+with no separate service. AGE artifacts come from AGE_ARTIFACTS_DIR (built from
+source — see docker/database/Dockerfile); without it the asset is vector-only.
 
 ${BOLD}Usage:${NC}
   ./build-release [command]
@@ -368,7 +389,7 @@ ${BOLD}Commands:${NC}
   ${GREEN}all${NC}             Build backend asset + Electron installer
   ${GREEN}installer${NC}       Build only the Electron app installer (~150 MB)
   ${GREEN}backend${NC}         Build the backend release asset (~50 MB)
-  ${GREEN}postgres${NC}        Build the PostgreSQL + pgvector asset (~200 MB; needs dpkg-deb)
+  ${GREEN}postgres${NC}        Build the PostgreSQL + pgvector (+ AGE if AGE_ARTIFACTS_DIR) asset (~200 MB; needs dpkg-deb)
   ${GREEN}models-cpu${NC}      Build the models service for CPU (~2 GB)
   ${GREEN}models-gpu${NC}      Build the models service for GPU/CUDA (~5 GB)
   ${GREEN}models-all${NC}      Build both CPU and GPU variants
