@@ -238,8 +238,9 @@ build_models() {
   [ -f "jobs.py" ] || fail "models/jobs.py not found"
 
   # Each variant builds in its OWN venv with its OWN deps. CPU and CUDA builds of
-  # torch/llama-cpp-python can't coexist in one environment, so the variant must
-  # decide what gets installed — not just the asset name.
+  # torch can't coexist in one environment, so the variant must decide what gets
+  # installed — not just the asset name. The LLM runtime is no longer among them:
+  # it is the llama-server binary copied into the bundle further down.
   local venv="$ROOT_DIR/.build-staging/venv-models-${variant}"
   info "Creating isolated build venv (${variant})..."
   rm -rf "$venv"
@@ -256,16 +257,9 @@ build_models() {
   pip install --quiet --upgrade pip
   if [ "$variant" = "gpu" ]; then
     # GPU wheels first (CUDA torch + cupy via their extra-index-url), then the
-    # rest; requirements.txt sees torch/llama-cpp already satisfied and won't pull
-    # the CPU builds over them.
+    # rest; requirements.txt sees torch already satisfied and won't pull the CPU
+    # build over it.
     pip install --quiet -r requirements-gpu.txt
-    # llama-cpp-python: the abetlen cu126 prebuilt index has no wheel for current
-    # Python, so any pip index resolution silently lands on the CPU wheel from
-    # PyPI (then the LLM runs on CPU — no libggml-cuda.so bundled). Compile it
-    # from source with CUDA instead. Requires nvcc + cmake + CUDA dev libs
-    # (libcublas/libcudart) on the build host.
-    command -v nvcc >/dev/null 2>&1 || fail "gpu build needs nvcc (CUDA toolkit) to compile llama-cpp-python with CUDA"
-    CMAKE_ARGS="-DGGML_CUDA=on" pip install --quiet --no-binary llama-cpp-python --no-cache-dir llama-cpp-python
   fi
   pip install --quiet -r requirements.txt
   pip install --quiet pyinstaller
@@ -296,7 +290,6 @@ build_models() {
     --collect-all spacy \
     --collect-all en_core_web_sm \
     --copy-metadata en_core_web_sm \
-    --collect-all llama_cpp \
     --collect-all docling \
     --collect-submodules tasks \
     --add-data "common:common" \
@@ -307,6 +300,22 @@ build_models() {
     jobs.py
 
   ok "Models service built (spaCy model + metadata bundled in-place)"
+
+  # The inference engine travels with the asset. There is no `manage` in an
+  # installed app to start it, so the worker looks for llama-server next to its
+  # own executable (see services/llama_server.py) and starts it when nothing else
+  # has. Whether the copied binary has CUDA is whatever `manage llama install`
+  # put in bin/llama — the variant name here does not change it.
+  if [ -x "$ROOT_DIR/bin/llama/llama-server" ]; then
+    info "Bundling inference engine (llama-server)..."
+    mkdir -p "dist/documents-models/llama"
+    cp -a "$ROOT_DIR/bin/llama/." "dist/documents-models/llama/"
+    ok "Engine bundled ($(du -sh dist/documents-models/llama | cut -f1))"
+  else
+    warn "No engine at bin/llama/llama-server — the asset ships without one."
+    warn "Run 'bash manage llama install' before building, or the installed app"
+    warn "will have no LLM until LLAMA_SERVER_BIN/URL points it at one."
+  fi
 
   mkdir -p "$RELEASE_DIR"
   local name="documents-models-v${APP_VERSION}-${PLATFORM}-${variant}"

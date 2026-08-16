@@ -11,7 +11,11 @@ playground/**
 models/venv/
 .backend.log
 .models.log
+.llama.log
 .pids
+# The inference engine binary, installed per machine by `manage llama:install`
+# (a CPU or CUDA build of llama.cpp — not something to version).
+bin/
 .env
 .logs/
 .claude/**

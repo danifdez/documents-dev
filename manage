@@ -316,6 +316,49 @@ MAX_LOG_BACKUPS=3
 MAX_LOG_SIZE=$((10 * 1024 * 1024))  # 10MB per log file
 LOG_CHECK_INTERVAL=60                # check every 60 seconds
 
+# ── Inference engine (llama-server) ─────────────────────────────────
+# There is one engine on the machine and it belongs to documents-dev. The models
+# worker, the backend and the embedded browser all generate through it over HTTP
+# instead of each loading the weights: one copy of the model in memory, one queue,
+# so the chat doesn't wait behind whatever the indexer is doing.
+#
+# It lives in bin/llama/ and is started like any other service here. The models
+# worker knows how to start it too, as a last resort when a job needs the LLM and
+# nothing answers — same binary, same settings (services/llama_server.py).
+LLAMA_DIR="$ROOT_DIR/bin/llama"
+LLAMA_BIN="$LLAMA_DIR/llama-server"
+LLAMA_LOG="$ROOT_DIR/.llama.log"
+# The build the embedded browser compiles, so both speak the same server API.
+LLAMA_TAG="${LLAMA_CPP_TAG:-b10243}"
+
+# Where the engine answers. The worker resolves this (env, then models config,
+# then its own default), so ask it rather than duplicate the rules here.
+llama_url() {
+  local url=""
+  if [ -x "$ROOT_DIR/models/.venv/bin/python" ]; then
+    url=$( (cd "$ROOT_DIR/models" && .venv/bin/python -m services.llama_server --url 2>/dev/null | tail -1) || true )
+  fi
+  echo "${url:-${LLAMA_SERVER_URL:-http://127.0.0.1:18080}}"
+}
+
+llama_port() {
+  llama_url | sed -E 's#.*:([0-9]+)/?$#\1#'
+}
+
+llama_is_alive() {
+  local url="${1:-$(llama_url)}"
+  curl -fsS --max-time 2 "$url/health" >/dev/null 2>&1
+}
+
+# The .gguf the engine has loaded, for the status lines. Empty when it can't be
+# asked, which the callers print as nothing rather than as an error.
+llama_served_model() {
+  local url="${1:-$(llama_url)}"
+  curl -fsS --max-time 3 "$url/props" 2>/dev/null | python3 -c \
+    'import sys,json,os;print(os.path.basename((json.load(sys.stdin).get("model_path") or "")))' \
+    2>/dev/null || true
+}
+
 # ── Kill all processes matching a pattern (thorough cleanup) ──
 kill_by_pattern() {
   local pattern="$1" label="${2:-process}"
@@ -362,6 +405,9 @@ is_service_running() {
     backend) pgrep -f "nest start" >/dev/null 2>&1 && return 0 ;;
     models)  pgrep -f "python jobs.py" >/dev/null 2>&1 && return 0 ;;
     voice)   pgrep -f "voice.run_pool" >/dev/null 2>&1 && return 0 ;;
+    # By port, not by name: another llama-server (the browser's own, a manual
+    # one) may be running on this machine and is none of our business.
+    llama)   pgrep -f "llama-server .*--port $(llama_port)" >/dev/null 2>&1 && return 0 ;;
   esac
   return 1  # not running
 }
@@ -395,7 +441,7 @@ start_log_watchdog() {
   (
     while true; do
       sleep "$LOG_CHECK_INTERVAL"
-      for logfile in "$ROOT_DIR"/.backend.log "$ROOT_DIR"/.models.log "$ROOT_DIR"/.playground.log; do
+      for logfile in "$ROOT_DIR"/.backend.log "$ROOT_DIR"/.models.log "$ROOT_DIR"/.llama.log "$ROOT_DIR"/.playground.log; do
         if [ -f "$logfile" ]; then
           size=$(stat -c%s "$logfile" 2>/dev/null || echo 0)
           if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
@@ -515,6 +561,10 @@ cmd_install() {
   bash install
   cd "$ROOT_DIR"
 
+  # ── Inference engine, shared by every service that generates text ──
+  info "Installing inference engine (llama-server)..."
+  install_llama_engine
+
   # ── Summary ──
   echo ""
   printf "${GREEN}============================================${NC}\n"
@@ -526,6 +576,7 @@ cmd_install() {
   echo ""
   echo "  Or run individually:"
   echo "    Infrastructure:      docker compose up -d"
+  echo "    Inference engine:    cd models && source .venv/bin/activate && python -m services.llama_server"
   echo "    Backend:             cd backend && npm run start:dev"
   echo "    Models:              cd models && source .venv/bin/activate && python jobs.py"
   echo "    Frontend:            cd frontend && npm start"
@@ -539,11 +590,12 @@ save_pidfile() {
   echo "BACKEND_PID=${BACKEND_PID:-}" > "$PIDFILE"
   echo "MODELS_PID=${MODELS_PID:-}" >> "$PIDFILE"
   echo "VOICE_PID=${VOICE_PID:-}" >> "$PIDFILE"
+  echo "LLAMA_PID=${LLAMA_PID:-}" >> "$PIDFILE"
   echo "LOG_WATCHDOG_PID=${LOG_WATCHDOG_PID:-}" >> "$PIDFILE"
 }
 
 source_pidfile() {
-  BACKEND_PID="" ; MODELS_PID="" ; VOICE_PID="" ; LOG_WATCHDOG_PID=""
+  BACKEND_PID="" ; MODELS_PID="" ; VOICE_PID="" ; LLAMA_PID="" ; LOG_WATCHDOG_PID=""
   if [ -f "$PIDFILE" ]; then source "$PIDFILE"; fi
 }
 
@@ -556,6 +608,118 @@ ensure_log_watchdog() {
   start_log_watchdog
   save_pidfile
   ok "Log watchdog started (rotates at ${MAX_LOG_SIZE} bytes, checks every ${LOG_CHECK_INTERVAL}s)"
+}
+
+# ── Inference engine ────────────────────────────────────────────────
+# Puts a llama-server in bin/llama/. Prefers a local llama.cpp build when
+# LLAMA_CPP_BUILD_DIR points at one — that build knows this machine's GPU, which
+# the portable release binaries do not — and otherwise downloads the official
+# prebuilt for this platform.
+install_llama_engine() {
+  local force="${1:-}"
+  if [ -x "$LLAMA_BIN" ] && [ "$force" != "--force" ]; then
+    ok "Inference engine already installed: $LLAMA_BIN"
+    return 0
+  fi
+
+  if [ -n "${LLAMA_CPP_BUILD_DIR:-}" ]; then
+    [ -x "${LLAMA_CPP_BUILD_DIR}/llama-server" ] \
+      || fail "LLAMA_CPP_BUILD_DIR=${LLAMA_CPP_BUILD_DIR} has no executable llama-server"
+    info "Copying engine from $LLAMA_CPP_BUILD_DIR..."
+    mkdir -p "$LLAMA_DIR"
+    # The whole directory: llama-server is linked against libllama/libggml sitting
+    # next to it (RUNPATH $ORIGIN), so the .so files have to travel with it.
+    cp -a "${LLAMA_CPP_BUILD_DIR}/." "$LLAMA_DIR/"
+    ok "Inference engine installed: $LLAMA_BIN ($(du -sh "$LLAMA_DIR" | cut -f1))"
+    return 0
+  fi
+
+  local os arch asset
+  os="$(uname -s)"; arch="$(uname -m)"
+  case "$os/$arch" in
+    Linux/x86_64)  asset="llama-${LLAMA_TAG}-bin-ubuntu-x64.tar.gz" ;;
+    Linux/aarch64) asset="llama-${LLAMA_TAG}-bin-ubuntu-arm64.tar.gz" ;;
+    Darwin/arm64)  asset="llama-${LLAMA_TAG}-bin-macos-arm64.tar.gz" ;;
+    Darwin/x86_64) asset="llama-${LLAMA_TAG}-bin-macos-x64.tar.gz" ;;
+    *) fail "No prebuilt llama-server for $os/$arch. Build llama.cpp and re-run with LLAMA_CPP_BUILD_DIR=<dir containing llama-server>." ;;
+  esac
+  local url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/${asset}"
+  local tmp; tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  info "Downloading inference engine ${LLAMA_TAG} (${asset})..."
+  curl -fL --progress-bar "$url" -o "$tmp/engine.tar.gz" || fail "Could not download $url"
+  tar xzf "$tmp/engine.tar.gz" -C "$tmp" || fail "Could not unpack $asset"
+  local found
+  found="$(find "$tmp" -type f -name llama-server | head -1)"
+  [ -n "$found" ] || fail "$asset contains no llama-server"
+  mkdir -p "$LLAMA_DIR"
+  cp -a "$(dirname "$found")/." "$LLAMA_DIR/"
+  chmod +x "$LLAMA_BIN"
+  ok "Inference engine installed: $LLAMA_BIN ($(du -sh "$LLAMA_DIR" | cut -f1))"
+}
+
+start_llama() {
+  source_pidfile
+  local url; url="$(llama_url)"
+
+  # Somebody else's engine already answers there — a browser build, a manual run,
+  # a remote one. Sharing is the whole point, so use it and start nothing.
+  if llama_is_alive "$url"; then
+    ok "Inference engine already answering at $url ($(llama_served_model "$url"))"
+    return 0
+  fi
+  if is_service_running llama LLAMA_PID; then
+    warn "Inference engine is already starting. Skipping."
+    return 0
+  fi
+  if [ ! -x "$LLAMA_BIN" ] && [ -z "${LLAMA_SERVER_BIN:-}" ]; then
+    install_llama_engine
+  fi
+
+  ensure_log_dir
+  rotate_log "$LLAMA_LOG"
+  kill_by_pattern "llama-server .*--port $(llama_port)" "engine orphan" 2>/dev/null || true
+  info "Starting inference engine..."
+  cd "$ROOT_DIR/models"
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+  # `python -m services.llama_server` execs the binary, so this PID *is* the
+  # engine's, and it comes up with exactly the model and context the jobs expect.
+  setsid python -m services.llama_server > "$LLAMA_LOG" 2>&1 &
+  LLAMA_PID=$!
+  deactivate
+  cd "$ROOT_DIR"
+  save_pidfile
+
+  # Loading a quantised model off a cold cache takes a while, and until /health
+  # answers 200 the engine is up but useless — so wait for it rather than let the
+  # first job time out.
+  local waited=0 timeout="${LLAMA_START_TIMEOUT:-300}"
+  while [ "$waited" -lt "$timeout" ]; do
+    if llama_is_alive "$url"; then
+      ok "Inference engine ready at $url (PGID: $LLAMA_PID) — $(llama_served_model "$url")"
+      return 0
+    fi
+    if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+      LLAMA_PID=""
+      save_pidfile
+      warn "Inference engine exited while starting. See $LLAMA_LOG"
+      return 1
+    fi
+    sleep 2; waited=$((waited + 2))
+  done
+  warn "Inference engine still not answering at $url after ${waited}s. See $LLAMA_LOG"
+  return 1
+}
+
+stop_llama() {
+  source_pidfile
+  if [ -n "${LLAMA_PID:-}" ] && kill_process_group "${LLAMA_PID}"; then
+    ok "Inference engine stopped (PGID: ${LLAMA_PID})"
+  fi
+  LLAMA_PID=""
+  save_pidfile
+  kill_by_pattern "llama-server .*--port $(llama_port)" "engine orphan" 2>/dev/null || true
 }
 
 start_backend() {
@@ -681,7 +845,7 @@ stop_docker_service() {
 
 is_known_component() {
   case "$1" in
-    backend|models|voice|database) return 0 ;;
+    backend|models|voice|database|llama) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -702,11 +866,18 @@ print_start_summary() {
   if [ -n "${VOICE_PID:-}" ]; then
     echo "  Voice worker:   running                (PID: $VOICE_PID)"
   fi
+  local engine_url; engine_url="$(llama_url)"
+  if llama_is_alive "$engine_url"; then
+    echo "  Inference:      $engine_url  ($(llama_served_model "$engine_url"))"
+  else
+    echo "  Inference:      not running            (start: ./manage start llama)"
+  fi
   echo "  PostgreSQL:     localhost:5432"
   echo ""
   echo "  Logs:"
   echo "    Backend:      tail -f .backend.log"
   echo "    Models:       tail -f .models.log"
+  echo "    Inference:    tail -f .llama.log"
   echo ""
   echo "  Stop:           ./manage stop"
   echo ""
@@ -722,7 +893,7 @@ cmd_start() {
   # Per-component start
   if [ $# -gt 0 ]; then
     for component in "$@"; do
-      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database)"
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, llama, database)"
     done
     for component in "$@"; do
       case "$component" in
@@ -733,7 +904,15 @@ cmd_start() {
           ;;
         models)
           ensure_log_watchdog
+          # The worker generates through the engine, so bring the engine up first.
+          # A warning is enough if it won't start: most job types don't need the
+          # LLM, and the ones that do will try to start it themselves.
+          start_llama || warn "Models will start without an engine; LLM jobs will fail until it is up."
           start_models
+          ;;
+        llama)
+          ensure_log_watchdog
+          start_llama || true
           ;;
         voice)
           ensure_log_watchdog
@@ -758,7 +937,7 @@ cmd_start() {
     warn "Models is already running. Skipping."
     models_already=1
   fi
-  if [ "$backend_already" -eq 1 ] && [ "$models_already" -eq 1 ]; then
+  if [ "$backend_already" -eq 1 ] && [ "$models_already" -eq 1 ] && llama_is_alive; then
     warn "All services are already running. Use './manage stop' first to restart."
     return 0
   fi
@@ -771,6 +950,10 @@ cmd_start() {
   ensure_pg_extensions
 
   ensure_log_watchdog
+
+  # Before the worker: everything that generates text goes through the engine, and
+  # the worker warns on every LLM job until it answers.
+  start_llama || warn "Starting without an inference engine; LLM jobs will fail until it is up."
 
   if [ "$backend_already" -eq 0 ]; then start_backend; fi
   if [ "$models_already" -eq 0 ]; then start_models; fi
@@ -790,13 +973,14 @@ cmd_stop() {
   # Per-component stop (don't tear down docker infra unless explicitly named)
   if [ $# -gt 0 ]; then
     for component in "$@"; do
-      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, database)"
+      is_known_component "$component" || fail "Unknown component '$component' (valid: backend, models, voice, llama, database)"
     done
     for component in "$@"; do
       case "$component" in
         backend) stop_backend ;;
         models)  stop_models ;;
         voice)   stop_voice_worker ;;
+        llama)   stop_llama ;;
         database) stop_docker_service "$component" ;;
       esac
     done
@@ -817,6 +1001,9 @@ cmd_stop() {
     if kill_process_group "${VOICE_PID:-}"; then
       ok "Voice worker process group stopped (PGID: ${VOICE_PID})"
     fi
+    if kill_process_group "${LLAMA_PID:-}"; then
+      ok "Inference engine stopped (PGID: ${LLAMA_PID})"
+    fi
     if [ -n "${LOG_WATCHDOG_PID:-}" ] && kill -0 "${LOG_WATCHDOG_PID}" 2>/dev/null; then
       kill "${LOG_WATCHDOG_PID}" 2>/dev/null || true
       ok "Log watchdog stopped"
@@ -831,6 +1018,9 @@ cmd_stop() {
   kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
   kill_by_pattern "voice.run_pool" "voice orphan" 2>/dev/null || true
   kill_by_pattern "voice.run_live_worker" "voice orphan" 2>/dev/null || true
+  # Only the engine on our port: another llama-server on this machine (the
+  # browser's own, a manual one) is not ours to kill.
+  kill_by_pattern "llama-server .*--port $(llama_port)" "engine orphan" 2>/dev/null || true
 
   local port_pid
   port_pid=$(lsof -ti:3000 2>/dev/null || true)
@@ -1004,8 +1194,9 @@ cmd_logs() {
   case "$SERVICE" in
     backend)    LOGFILE="$ROOT_DIR/.backend.log" ;;
     models)     LOGFILE="$ROOT_DIR/.models.log" ;;
+    llama)      LOGFILE="$LLAMA_LOG" ;;
     playground) LOGFILE="$ROOT_DIR/.playground.log" ;;
-    *)          fail "Usage: $0 logs <backend|models|playground>" ;;
+    *)          fail "Usage: $0 logs <backend|models|llama|playground>" ;;
   esac
 
   [ -f "$LOGFILE" ] || fail "Log file not found: $LOGFILE. Is the service running?"
@@ -1561,18 +1752,24 @@ Commands:
 
   start [components...]   Start services. With no args, starts everything:
                           - PostgreSQL (Docker)
+                          - Inference engine (llama-server, bin/llama)
                           - Backend (local, npm run start:dev)
                           - Models (local, python jobs.py in .venv)
                           With component names, only those are started:
                             ./manage start backend
                             ./manage start models database
-                          Valid components: backend, models, database.
+                          Valid components: backend, models, voice, llama, database.
 
   stop [components...]    Stop services. With no args, stops everything (incl. docker).
                           With component names, only those are stopped (docker
                           infra stays up unless explicitly named):
                             ./manage stop backend
                             ./manage stop models database
+
+  llama:install [--force] Install the inference engine into bin/llama. Downloads the
+                          official llama.cpp build for this platform, or copies a
+                          local one when LLAMA_CPP_BUILD_DIR points at a build (use
+                          that for a CUDA engine). Run by 'install' already.
 
   reset [--yes]           Permanently delete all project data and re-initialize.
                           --yes  Skip confirmation prompt
@@ -1581,7 +1778,7 @@ Commands:
 
   playground:stop         Stop the Jupyter playground
 
-  logs <service>          Tail logs for a service (backend, models, playground)
+  logs <service>          Tail logs for a service (backend, models, llama, playground)
 
   export [output_file]    Create a compressed backup of the active profile's database and documents.
 
@@ -1602,6 +1799,14 @@ Commands:
   help                    Show this help message.
 
 Notes:
+  One inference engine, shared. Everything that generates text — the models
+  worker's jobs, and the embedded browser through the URL the backend announces
+  in /auth/status — talks to the llama-server in bin/llama. Nothing loads the
+  weights in-process any more. Point it elsewhere (a build with CUDA, another
+  machine) with LLAMA_SERVER_URL / LLAMA_SERVER_BIN in backend/.env; what it
+  serves comes from models/config/config.json (llm_defaults) and the model most
+  task configs name.
+
   Each profile has two file stores:
     - documents/          Hot storage (active resource files).
     - documents-archive/  Cold storage (resources archived from the app's UI).
@@ -1622,6 +1827,7 @@ shift || true
 
 case "$COMMAND" in
   install)            cmd_install "$@" ;;
+  llama:install)      install_llama_engine "$@" ;;
   start)              cmd_start "$@" ;;
   stop)               cmd_stop "$@" ;;
   reset)              cmd_reset "$@" ;;
