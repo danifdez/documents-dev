@@ -322,14 +322,12 @@ LOG_CHECK_INTERVAL=60                # check every 60 seconds
 # instead of each loading the weights: one copy of the model in memory, one queue,
 # so the chat doesn't wait behind whatever the indexer is doing.
 #
-# It lives in bin/llama/ and is started like any other service here. The models
+# It lives in models/bin/llama/ and is started like any other service here. The models
 # worker knows how to start it too, as a last resort when a job needs the LLM and
 # nothing answers — same binary, same settings (services/llama_server.py).
-LLAMA_DIR="$ROOT_DIR/bin/llama"
+LLAMA_DIR="$ROOT_DIR/models/bin/llama"
 LLAMA_BIN="$LLAMA_DIR/llama-server"
 LLAMA_LOG="$ROOT_DIR/.llama.log"
-# The build the embedded browser compiles, so both speak the same server API.
-LLAMA_TAG="${LLAMA_CPP_TAG:-b10243}"
 
 # Where the engine answers. The worker resolves this (env, then models config,
 # then its own default), so ask it rather than duplicate the rules here.
@@ -561,10 +559,6 @@ cmd_install() {
   bash install
   cd "$ROOT_DIR"
 
-  # ── Inference engine, shared by every service that generates text ──
-  info "Installing inference engine (llama-server)..."
-  install_llama_engine
-
   # ── Summary ──
   echo ""
   printf "${GREEN}============================================${NC}\n"
@@ -610,54 +604,6 @@ ensure_log_watchdog() {
   ok "Log watchdog started (rotates at ${MAX_LOG_SIZE} bytes, checks every ${LOG_CHECK_INTERVAL}s)"
 }
 
-# ── Inference engine ────────────────────────────────────────────────
-# Puts a llama-server in bin/llama/. Prefers a local llama.cpp build when
-# LLAMA_CPP_BUILD_DIR points at one — that build knows this machine's GPU, which
-# the portable release binaries do not — and otherwise downloads the official
-# prebuilt for this platform.
-install_llama_engine() {
-  local force="${1:-}"
-  if [ -x "$LLAMA_BIN" ] && [ "$force" != "--force" ]; then
-    ok "Inference engine already installed: $LLAMA_BIN"
-    return 0
-  fi
-
-  if [ -n "${LLAMA_CPP_BUILD_DIR:-}" ]; then
-    [ -x "${LLAMA_CPP_BUILD_DIR}/llama-server" ] \
-      || fail "LLAMA_CPP_BUILD_DIR=${LLAMA_CPP_BUILD_DIR} has no executable llama-server"
-    info "Copying engine from $LLAMA_CPP_BUILD_DIR..."
-    mkdir -p "$LLAMA_DIR"
-    # The whole directory: llama-server is linked against libllama/libggml sitting
-    # next to it (RUNPATH $ORIGIN), so the .so files have to travel with it.
-    cp -a "${LLAMA_CPP_BUILD_DIR}/." "$LLAMA_DIR/"
-    ok "Inference engine installed: $LLAMA_BIN ($(du -sh "$LLAMA_DIR" | cut -f1))"
-    return 0
-  fi
-
-  local os arch asset
-  os="$(uname -s)"; arch="$(uname -m)"
-  case "$os/$arch" in
-    Linux/x86_64)  asset="llama-${LLAMA_TAG}-bin-ubuntu-x64.tar.gz" ;;
-    Linux/aarch64) asset="llama-${LLAMA_TAG}-bin-ubuntu-arm64.tar.gz" ;;
-    Darwin/arm64)  asset="llama-${LLAMA_TAG}-bin-macos-arm64.tar.gz" ;;
-    Darwin/x86_64) asset="llama-${LLAMA_TAG}-bin-macos-x64.tar.gz" ;;
-    *) fail "No prebuilt llama-server for $os/$arch. Build llama.cpp and re-run with LLAMA_CPP_BUILD_DIR=<dir containing llama-server>." ;;
-  esac
-  local url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/${asset}"
-  local tmp; tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
-  info "Downloading inference engine ${LLAMA_TAG} (${asset})..."
-  curl -fL --progress-bar "$url" -o "$tmp/engine.tar.gz" || fail "Could not download $url"
-  tar xzf "$tmp/engine.tar.gz" -C "$tmp" || fail "Could not unpack $asset"
-  local found
-  found="$(find "$tmp" -type f -name llama-server | head -1)"
-  [ -n "$found" ] || fail "$asset contains no llama-server"
-  mkdir -p "$LLAMA_DIR"
-  cp -a "$(dirname "$found")/." "$LLAMA_DIR/"
-  chmod +x "$LLAMA_BIN"
-  ok "Inference engine installed: $LLAMA_BIN ($(du -sh "$LLAMA_DIR" | cut -f1))"
-}
-
 start_llama() {
   source_pidfile
   local url; url="$(llama_url)"
@@ -673,7 +619,7 @@ start_llama() {
     return 0
   fi
   if [ ! -x "$LLAMA_BIN" ] && [ -z "${LLAMA_SERVER_BIN:-}" ]; then
-    install_llama_engine
+    fail "Inference engine missing. Run 'cd models && bash install' first."
   fi
 
   ensure_log_dir
@@ -1766,10 +1712,6 @@ Commands:
                             ./manage stop backend
                             ./manage stop models database
 
-  llama:install [--force] Install the inference engine into bin/llama. Downloads the
-                          official llama.cpp build for this platform, or copies a
-                          local one when LLAMA_CPP_BUILD_DIR points at a build (use
-                          that for a CUDA engine). Run by 'install' already.
 
   reset [--yes]           Permanently delete all project data and re-initialize.
                           --yes  Skip confirmation prompt
@@ -1827,7 +1769,6 @@ shift || true
 
 case "$COMMAND" in
   install)            cmd_install "$@" ;;
-  llama:install)      install_llama_engine "$@" ;;
   start)              cmd_start "$@" ;;
   stop)               cmd_stop "$@" ;;
   reset)              cmd_reset "$@" ;;
