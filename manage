@@ -357,16 +357,44 @@ llama_served_model() {
     2>/dev/null || true
 }
 
+# ── Match `pgrep -f` results but keep only processes whose cwd is inside a
+# given directory. A cmdline pattern like "nest start" or "python jobs.py" is
+# generic enough to match an unrelated project's process of the same name
+# running elsewhere on the same host (another checkout, a Docker container) —
+# scoping by cwd (via /proc/<pid>/cwd) keeps matches limited to this checkout.
+# Processes we can't read the cwd of (e.g. another user's container) are
+# never matched, which is the safe default here.
+pids_in_dir() {
+  local pattern="$1" dir="$2" pid cwd
+  for pid in $(pgrep -f "$pattern" 2>/dev/null || true); do
+    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+    case "$cwd" in
+      "$dir"|"$dir"/*) printf '%s\n' "$pid" ;;
+    esac
+  done
+  return 0
+}
+
 # ── Kill all processes matching a pattern (thorough cleanup) ──
+# scope_dir, when given, restricts matches to processes whose cwd is under it
+# (see pids_in_dir) so this never reaches into an unrelated project's process.
 kill_by_pattern() {
-  local pattern="$1" label="${2:-process}"
+  local pattern="$1" label="${2:-process}" scope_dir="${3:-}"
   local pids
-  pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+  if [ -n "$scope_dir" ]; then
+    pids=$(pids_in_dir "$pattern" "$scope_dir")
+  else
+    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+  fi
   if [ -n "$pids" ]; then
     echo "$pids" | xargs -r kill 2>/dev/null || true
     sleep 0.5
     # Force kill any survivors
-    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+    if [ -n "$scope_dir" ]; then
+      pids=$(pids_in_dir "$pattern" "$scope_dir")
+    else
+      pids=$(pgrep -f "$pattern" 2>/dev/null || true)
+    fi
     if [ -n "$pids" ]; then
       echo "$pids" | xargs -r kill -9 2>/dev/null || true
     fi
@@ -398,11 +426,13 @@ is_service_running() {
       return 0  # running
     fi
   fi
-  # Also check by process pattern as fallback
+  # Also check by process pattern as fallback, scoped to this checkout (see
+  # pids_in_dir) so another project's same-named process on this host — e.g.
+  # a different repo's own "nest start --watch" — is never mistaken for ours.
   case "$name" in
-    backend) pgrep -f "nest start" >/dev/null 2>&1 && return 0 ;;
-    models)  pgrep -f "python jobs.py" >/dev/null 2>&1 && return 0 ;;
-    voice)   pgrep -f "voice.run_pool" >/dev/null 2>&1 && return 0 ;;
+    backend) [ -n "$(pids_in_dir "nest start" "$ROOT_DIR/backend")" ] && return 0 ;;
+    models)  [ -n "$(pids_in_dir "python jobs.py" "$ROOT_DIR/models")" ] && return 0 ;;
+    voice)   [ -n "$(pids_in_dir "voice.run_pool" "$ROOT_DIR/models")" ] && return 0 ;;
     # By port, not by name: another llama-server (the browser's own, a manual
     # one) may be running on this machine and is none of our business.
     llama)   pgrep -f "llama-server .*--port $(llama_port)" >/dev/null 2>&1 && return 0 ;;
@@ -604,6 +634,32 @@ ensure_log_watchdog() {
   ok "Log watchdog started (rotates at ${MAX_LOG_SIZE} bytes, checks every ${LOG_CHECK_INTERVAL}s)"
 }
 
+# ── Keep playground's venv absolute paths in sync with where this checkout
+# actually lives. `python -m venv` bakes the venv's absolute path into
+# pyvenv.cfg and bin/activate*; if the project directory is ever moved or
+# renamed after the venv was created, those baked-in paths go stale and
+# `source .venv/bin/activate` silently fails to put a working `python` on
+# PATH. Detect and self-heal right before activating — regenerating just the
+# scripts (no --clear) never touches already-installed packages.
+#
+# This is for playground only: it lives inside this monorepo, not as its own
+# checkout. backend/models/frontend are separate submodules that can each be
+# installed and run standalone on their own machine, so the same self-healing
+# for their venvs lives in their own install/ensure-venv (see models/), and
+# manage just calls into it — this script only orchestrates, it doesn't own
+# a submodule's environment.
+ensure_playground_venv_aligned() {
+  local venv_dir="$1" activate
+  activate="$venv_dir/bin/activate"
+  [ -f "$activate" ] || return 0
+  grep -qF "VIRTUAL_ENV=$venv_dir" "$activate" 2>/dev/null && return 0
+  warn "Virtualenv at $venv_dir has stale absolute paths (checkout was moved) — realigning..."
+  local py_bin
+  py_bin=$(command -v python3 || command -v python)
+  "$py_bin" -m venv "$venv_dir"
+  ok "Realigned $venv_dir"
+}
+
 start_llama() {
   source_pidfile
   local url; url="$(llama_url)"
@@ -627,6 +683,7 @@ start_llama() {
   kill_by_pattern "llama-server .*--port $(llama_port)" "engine orphan" 2>/dev/null || true
   info "Starting inference engine..."
   cd "$ROOT_DIR/models"
+  "$ROOT_DIR/models/ensure-venv"
   # shellcheck disable=SC1091
   source .venv/bin/activate
   # `python -m services.llama_server` execs the binary, so this PID *is* the
@@ -676,8 +733,8 @@ start_backend() {
   fi
   ensure_log_dir
   rotate_log "$ROOT_DIR/.backend.log"
-  kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
-  kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
+  kill_by_pattern "nest start" "backend orphan" "$ROOT_DIR/backend" 2>/dev/null || true
+  kill_by_pattern "ts-node.*nest" "backend ts-node orphan" "$ROOT_DIR/backend" 2>/dev/null || true
   info "Starting backend..."
   cd "$ROOT_DIR/backend"
   setsid npm run start:dev > "$ROOT_DIR/.backend.log" 2>&1 &
@@ -695,9 +752,10 @@ start_models() {
   fi
   ensure_log_dir
   rotate_log "$ROOT_DIR/.models.log"
-  kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
+  kill_by_pattern "python jobs.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
   info "Starting models..."
   cd "$ROOT_DIR/models"
+  "$ROOT_DIR/models/ensure-venv"
   source .venv/bin/activate
   setsid python jobs.py > "$ROOT_DIR/.models.log" 2>&1 &
   MODELS_PID=$!
@@ -720,10 +778,11 @@ start_voice_worker() {
   fi
   ensure_log_dir
   rotate_log "$ROOT_DIR/.voice.log"
-  kill_by_pattern "voice.run_pool" "voice orphan" 2>/dev/null || true
-  kill_by_pattern "voice.run_live_worker" "voice orphan" 2>/dev/null || true
+  kill_by_pattern "voice.run_pool" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
+  kill_by_pattern "voice.run_live_worker" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
   info "Starting voice worker pool (size=${VOICE_WORKER_POOL_SIZE:-1})..."
   cd "$ROOT_DIR/models"
+  "$ROOT_DIR/models/ensure-venv"
   source .venv/bin/activate
   setsid python -m voice.run_pool > "$ROOT_DIR/.voice.log" 2>&1 &
   VOICE_PID=$!
@@ -740,8 +799,8 @@ stop_voice_worker() {
   fi
   VOICE_PID=""
   save_pidfile
-  kill_by_pattern "voice.run_pool" "voice orphan" 2>/dev/null || true
-  kill_by_pattern "voice.run_live_worker" "voice orphan" 2>/dev/null || true
+  kill_by_pattern "voice.run_pool" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
+  kill_by_pattern "voice.run_live_worker" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
 }
 
 start_docker_service() {
@@ -762,8 +821,8 @@ stop_backend() {
   fi
   BACKEND_PID=""
   save_pidfile
-  kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
-  kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
+  kill_by_pattern "nest start" "backend orphan" "$ROOT_DIR/backend" 2>/dev/null || true
+  kill_by_pattern "ts-node.*nest" "backend ts-node orphan" "$ROOT_DIR/backend" 2>/dev/null || true
   local port_pid
   port_pid=$(lsof -ti:3000 2>/dev/null || true)
   if [ -n "$port_pid" ]; then
@@ -779,7 +838,7 @@ stop_models() {
   fi
   MODELS_PID=""
   save_pidfile
-  kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
+  kill_by_pattern "python jobs.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
 }
 
 stop_docker_service() {
@@ -959,11 +1018,11 @@ cmd_stop() {
     warn "No PID file found."
   fi
 
-  kill_by_pattern "nest start" "backend orphan" 2>/dev/null || true
-  kill_by_pattern "ts-node.*nest" "backend ts-node orphan" 2>/dev/null || true
-  kill_by_pattern "python jobs.py" "models orphan" 2>/dev/null || true
-  kill_by_pattern "voice.run_pool" "voice orphan" 2>/dev/null || true
-  kill_by_pattern "voice.run_live_worker" "voice orphan" 2>/dev/null || true
+  kill_by_pattern "nest start" "backend orphan" "$ROOT_DIR/backend" 2>/dev/null || true
+  kill_by_pattern "ts-node.*nest" "backend ts-node orphan" "$ROOT_DIR/backend" 2>/dev/null || true
+  kill_by_pattern "python jobs.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
+  kill_by_pattern "voice.run_pool" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
+  kill_by_pattern "voice.run_live_worker" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
   # Only the engine on our port: another llama-server on this machine (the
   # browser's own, a manual one) is not ours to kill.
   kill_by_pattern "llama-server .*--port $(llama_port)" "engine orphan" 2>/dev/null || true
@@ -1088,6 +1147,7 @@ cmd_playground_start() {
   ensure_log_dir
   rotate_log "$ROOT_DIR/.playground.log"
   info "Starting Jupyter notebook..."
+  ensure_playground_venv_aligned "$PLAYGROUND_DIR/.venv"
   source .venv/bin/activate
   jupyter notebook > "$ROOT_DIR/.playground.log" 2>&1 &
   PLAYGROUND_PID=$!
