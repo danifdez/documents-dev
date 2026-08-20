@@ -323,7 +323,7 @@ LOG_CHECK_INTERVAL=60                # check every 60 seconds
 # so the chat doesn't wait behind whatever the indexer is doing.
 #
 # It lives in models/bin/llama/ and is started like any other service here. The models
-# worker knows how to start it too, as a last resort when a job needs the LLM and
+# worker knows how to start it too, as a last resort when an execution needs the LLM and
 # nothing answers — same binary, same settings (services/llama_server.py).
 LLAMA_DIR="$ROOT_DIR/models/bin/llama"
 LLAMA_BIN="$LLAMA_DIR/llama-server"
@@ -358,7 +358,7 @@ llama_served_model() {
 }
 
 # ── Match `pgrep -f` results but keep only processes whose cwd is inside a
-# given directory. A cmdline pattern like "nest start" or "python jobs.py" is
+# given directory. A cmdline pattern like "nest start" or "python executions.py" is
 # generic enough to match an unrelated project's process of the same name
 # running elsewhere on the same host (another checkout, a Docker container) —
 # scoping by cwd (via /proc/<pid>/cwd) keeps matches limited to this checkout.
@@ -431,7 +431,7 @@ is_service_running() {
   # a different repo's own "nest start --watch" — is never mistaken for ours.
   case "$name" in
     backend) [ -n "$(pids_in_dir "nest start" "$ROOT_DIR/backend")" ] && return 0 ;;
-    models)  [ -n "$(pids_in_dir "python jobs.py" "$ROOT_DIR/models")" ] && return 0 ;;
+    models)  [ -n "$(pids_in_dir "python executions.py" "$ROOT_DIR/models")" ] && return 0 ;;
     voice)   [ -n "$(pids_in_dir "voice.run_pool" "$ROOT_DIR/models")" ] && return 0 ;;
     # By port, not by name: another llama-server (the browser's own, a manual
     # one) may be running on this machine and is none of our business.
@@ -602,7 +602,7 @@ cmd_install() {
   echo "    Infrastructure:      docker compose up -d"
   echo "    Inference engine:    cd models && source .venv/bin/activate && python -m services.llama_server"
   echo "    Backend:             cd backend && npm run start:dev"
-  echo "    Models:              cd models && source .venv/bin/activate && python jobs.py"
+  echo "    Models:              cd models && source .venv/bin/activate && python executions.py"
   echo "    Frontend:            cd frontend && npm start"
   echo ""
 }
@@ -687,7 +687,7 @@ start_llama() {
   # shellcheck disable=SC1091
   source .venv/bin/activate
   # `python -m services.llama_server` execs the binary, so this PID *is* the
-  # engine's, and it comes up with exactly the model and context the jobs expect.
+  # engine's, and it comes up with exactly the model and context the executions expect.
   setsid python -m services.llama_server > "$LLAMA_LOG" 2>&1 &
   LLAMA_PID=$!
   deactivate
@@ -696,7 +696,7 @@ start_llama() {
 
   # Loading a quantised model off a cold cache takes a while, and until /health
   # answers 200 the engine is up but useless — so wait for it rather than let the
-  # first job time out.
+  # first execution time out.
   local waited=0 timeout="${LLAMA_START_TIMEOUT:-300}"
   while [ "$waited" -lt "$timeout" ]; do
     if llama_is_alive "$url"; then
@@ -752,12 +752,12 @@ start_models() {
   fi
   ensure_log_dir
   rotate_log "$ROOT_DIR/.models.log"
-  kill_by_pattern "python jobs.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
+  kill_by_pattern "python executions.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
   info "Starting models..."
   cd "$ROOT_DIR/models"
   "$ROOT_DIR/models/ensure-venv"
   source .venv/bin/activate
-  setsid python jobs.py > "$ROOT_DIR/.models.log" 2>&1 &
+  setsid python executions.py > "$ROOT_DIR/.models.log" 2>&1 &
   MODELS_PID=$!
   deactivate
   cd "$ROOT_DIR"
@@ -838,7 +838,7 @@ stop_models() {
   fi
   MODELS_PID=""
   save_pidfile
-  kill_by_pattern "python jobs.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
+  kill_by_pattern "python executions.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
 }
 
 stop_docker_service() {
@@ -910,9 +910,9 @@ cmd_start() {
         models)
           ensure_log_watchdog
           # The worker generates through the engine, so bring the engine up first.
-          # A warning is enough if it won't start: most job types don't need the
+          # A warning is enough if it won't start: most execution types don't need the
           # LLM, and the ones that do will try to start it themselves.
-          start_llama || warn "Models will start without an engine; LLM jobs will fail until it is up."
+          start_llama || warn "Models will start without an engine; LLM executions will fail until it is up."
           start_models
           ;;
         llama)
@@ -957,8 +957,8 @@ cmd_start() {
   ensure_log_watchdog
 
   # Before the worker: everything that generates text goes through the engine, and
-  # the worker warns on every LLM job until it answers.
-  start_llama || warn "Starting without an inference engine; LLM jobs will fail until it is up."
+  # the worker warns on every LLM execution until it answers.
+  start_llama || warn "Starting without an inference engine; LLM executions will fail until it is up."
 
   if [ "$backend_already" -eq 0 ]; then start_backend; fi
   if [ "$models_already" -eq 0 ]; then start_models; fi
@@ -1020,7 +1020,7 @@ cmd_stop() {
 
   kill_by_pattern "nest start" "backend orphan" "$ROOT_DIR/backend" 2>/dev/null || true
   kill_by_pattern "ts-node.*nest" "backend ts-node orphan" "$ROOT_DIR/backend" 2>/dev/null || true
-  kill_by_pattern "python jobs.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
+  kill_by_pattern "python executions.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
   kill_by_pattern "voice.run_pool" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
   kill_by_pattern "voice.run_live_worker" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
   # Only the engine on our port: another llama-server on this machine (the
@@ -1390,7 +1390,7 @@ _services_are_running() {
     if [ -n "${MODELS_PID:-}" ] && kill -0 "${MODELS_PID}" 2>/dev/null; then return 0; fi
   fi
   pgrep -f "nest start" >/dev/null 2>&1 && return 0
-  pgrep -f "python jobs.py" >/dev/null 2>&1 && return 0
+  pgrep -f "python executions.py" >/dev/null 2>&1 && return 0
   # Any container with our current project name?
   if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
     if docker ps --format '{{.Names}}' | grep -q "^${COMPOSE_PROJECT_NAME}-"; then
@@ -1760,7 +1760,7 @@ Commands:
                           - PostgreSQL (Docker)
                           - Inference engine (llama-server, bin/llama)
                           - Backend (local, npm run start:dev)
-                          - Models (local, python jobs.py in .venv)
+                          - Models (local, python executions.py in .venv)
                           With component names, only those are started:
                             ./manage start backend
                             ./manage start models database
@@ -1802,7 +1802,7 @@ Commands:
 
 Notes:
   One inference engine, shared. Everything that generates text — the models
-  worker's jobs, and the embedded browser through the URL the backend announces
+  worker executions, and the embedded browser through the URL the backend announces
   in /auth/status — talks to the llama-server in bin/llama. Nothing loads the
   weights in-process any more. Point it elsewhere (a build with CUDA, another
   machine) with LLAMA_SERVER_URL / LLAMA_SERVER_BIN in backend/.env; what it

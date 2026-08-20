@@ -8,10 +8,10 @@ Development monorepo for the **Documents** platform — an intelligent document 
 
 | Service | Description | Technologies |
 |---------|-------------|-------------|
-| **Backend** | REST API and job orchestration | NestJS, TypeORM, PostgreSQL, Socket.io |
+| **Backend** | REST API and execution orchestration | NestJS, TypeORM, PostgreSQL, Socket.io |
 | **Frontend** | Desktop application | Electron, Vue 3, Vite, Tailwind CSS |
 | **Models** | AI/ML processing workers | Python, Whisper, spaCy, pgvector |
-| **Inference engine** | One llama-server everything generates through: the workers' jobs, and any client the backend advertises it to (the embedded browser). Installed into `bin/llama/`, started by `manage`. | llama.cpp (`llama-server`), GGUF models |
+| **Inference engine** | One llama-server everything generates through: worker executions and any client the backend advertises it to (the embedded browser). Installed into `bin/llama/`, started by `manage`. | llama.cpp (`llama-server`), GGUF models |
 
 ## Quick Start
 

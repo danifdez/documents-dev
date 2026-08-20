@@ -8,29 +8,32 @@ Documents is a development monorepo that orchestrates three services, each with 
 
 | Directory | Stack | Role |
 |---|---|---|
-| `backend/` | NestJS, TypeORM, PostgreSQL, Socket.io | REST API, jobs queue, notifications |
+| `backend/` | NestJS, TypeORM, PostgreSQL, Socket.io | REST API, execution queue, notifications |
 | `frontend/` | Electron, Vue 3, Vite, Electron Forge | Desktop application |
 | `models/` | Python | AI/ML polling worker |
 
-### Job pipeline
+### Execution pipeline
 
-A feature commonly spans all three services through PostgreSQL's `jobs` table:
+A feature commonly spans all three services through PostgreSQL's `executions`
+table. Queueing is a capability of `Execution`, not a separate domain:
 
 ```text
 frontend (Vue service → HTTP)
-  → backend creates or processes a job
-  → models worker polls and handles heavy ML jobs
-  → result is written to the job row
+  → backend creates or processes an execution
+  → models worker polls and handles heavy ML executions
+  → result is written to the execution row
   → backend reads it and emits Socket.io notifications
   → frontend receives the notification and updates the UI
 ```
 
-- Backend owns the job types handled by `JobProcessorFactory`.
-- Models owns heavy ML types. Each handler is `tasks/<type>/<type>.py`, decorated with `@job_handler("<type>")` and enabled in `models/config/tasks.json`.
+- Backend owns finalization through `ExecutionProcessorFactory`.
+- Models owns heavy ML types. Each handler is `tasks/<type>/<type>.py`, decorated with `@execution_handler("<type>")` and enabled in `models/config/tasks.json`.
 - Both services poll the same table. `FOR UPDATE SKIP LOCKED` prevents collisions.
 - `backend/src/model/model.service.ts` is the backend-to-models bridge.
 
-PostgreSQL holds application data, the jobs queue, pgvector embeddings, and the Apache AGE entity graph. The schema is migration-first: TypeORM `synchronize` is disabled.
+PostgreSQL holds application data, executions and their append-only evidence,
+pgvector embeddings, and the Apache AGE entity graph. The schema is
+migration-first: TypeORM `synchronize` is disabled.
 
 ## Shared rules
 
@@ -39,7 +42,7 @@ PostgreSQL holds application data, the jobs queue, pgvector embeddings, and the 
 3. Make PostgreSQL changes migration-first. Every entity change needs a committed TypeORM migration; never rely on auto-sync.
 4. Use `./manage` for lifecycle operations. Do not hand-roll Docker lifecycle commands or kill service processes manually.
 5. Never run `./manage reset` or `./manage import` without explicit user confirmation. Both are destructive: they drop the schema and wipe `documents/`.
-6. Before calling a feature done, trace whether it needs coordinated backend, models, and frontend changes through the jobs pipeline.
+6. Before calling a feature done, trace whether it needs coordinated backend, models, and frontend changes through the execution pipeline.
 7. Respect feature flags: `FEATURE_*` on backend, `worker.capabilities.*` on models, and router `meta.feature` plus `featureStore` on frontend.
 8. Pin every dependency version exactly. npm dependencies must have no `^` or `~` and retain the lockfile; Python requirements use `==`; Docker and runtime versions must not use `latest` or floating ranges.
 
@@ -60,21 +63,20 @@ For infrastructure only, use `docker compose up -d` (PostgreSQL with pgvector an
 
 ## Backend (`backend/`)
 
-NestJS service owning the REST API, jobs queue, and Socket.io notifications.
+NestJS service owning the REST API, execution queue, and Socket.io notifications.
 
 ### Rules
 
 1. Register a new module in both `src/app.module.ts` and its relevant `TypeOrmModule.forFeature([...])` declaration.
 2. Ship every entity change with a committed migration.
-3. For a new job processor, implement `canProcess(jobType)` and add the class to the right `providers` array in `job-processor.module.ts`; retain its feature-flag guard when applicable.
+3. For a new execution processor, implement `canProcess(taskType)` and add the class to the right `providers` array in `execution-processor.module.ts`; retain its feature-flag guard when applicable.
 4. Keep heavy ML in `models/`. Backend processors orchestrate via `src/model/model.service.ts` and publish results through `NotificationGateway`.
-5. Run `npm run lint` before finishing and unit-test new service logic with a mocked repository using `getRepositoryToken(Entity)`.
+5. Do not run `npm run lint`: it uses `--fix` over the whole tree. Run `npm run build`, targeted tests, and non-fixing ESLint only on files changed deliberately. Unit-test new service logic with a mocked repository using `getRepositoryToken(Entity)`.
 
 ### Commands
 
 ```bash
 npm run start:dev
-npm run lint
 npm run test
 npm run migration:run
 npm run migration:revert
@@ -96,7 +98,11 @@ migrations/                 <timestamp>-<Name>.ts (up/down, raw SQL)
 test/unit/<feature>/        *.spec.ts mirrors src/
 ```
 
-`JobProcessorFactory` discovers processor providers at boot by scanning `processors/`, mapping a filename to its PascalCase DI class, then matching `canProcess`. Processors with unavailable dependencies are silently skipped. Create jobs through `JobService` with type, priority, and JSONB payload.
+`ExecutionProcessorFactory` discovers processor providers at boot by scanning
+`execution-processor/processors/`, mapping a filename to its PascalCase DI
+class, then matching `canProcess`. Processors with unavailable dependencies are
+silently skipped. Create work through `ExecutionService` with `taskType`,
+priority, JSONB payload and optional tree identity.
 
 Configuration comes from `@nestjs/config` and `backend/.env`. Relevant settings include `POSTGRES_*`, `PORT` (3000), `CORS_ORIGIN`, `AUTH_ENABLED`/`JWT_*`, `DOCUMENTS_STORAGE_DIR`, and `FEATURE_*`. TypeScript strict-null checks and `no-explicit-any` are disabled.
 
@@ -141,35 +147,45 @@ A screen change includes its page, route (with `meta.feature` when gated), store
 
 ## Models (`models/`)
 
-Python polling worker that consumes PostgreSQL jobs.
+Python polling worker that consumes PostgreSQL executions.
 
 ### Rules
 
-1. A job type `foo-bar` requires `tasks/foo_bar/foo_bar.py`, a handler decorated as `@job_handler("foo-bar")`, and an enabled entry in `config/tasks.json`. Missing any one makes the worker silently skip it.
-2. Return a dictionary: it is written verbatim to the job row and read by the backend, so keep its shape stable.
+1. An execution type `foo-bar` requires `tasks/foo_bar/foo_bar.py`, a handler decorated as `@execution_handler("foo-bar")`, and an enabled entry in `config/tasks.json`. Missing any one makes the worker silently skip it.
+2. Return a dictionary: it is written verbatim to the execution row and read by the backend, so keep its shape stable.
 3. For iteration without loading large models, disable capabilities in `config/config.json` with `worker.disable_llm` or `worker.disable_embeddings`.
-4. There is no linter or test harness. Prefer small pure functions that can be exercised directly; do not assume absent tooling.
+4. The standard-library tests live in `tests/`; the PostgreSQL execution test is opt-in through `RUN_EXECUTION_POSTGRES_E2E=1`.
 
 ### Commands
 
 ```bash
-python jobs.py
-python jobs.py --setup
+python executions.py
+python executions.py --setup
 ```
 
-`jobs.py` polls approximately every second, atomically claims a job, dispatches by type, and writes its result back. Its configuration is `config/config.json` merged over `common/config.default.json`.
+`executions.py` polls approximately every second, atomically claims an
+execution with a fenced `attemptId`, dispatches by type, and writes checkpoint
+and result back. Backend owns terminal finalization after applying effects. Its
+configuration is `config/config.json` merged over `common/config.default.json`.
 
 ### Task pattern and connections
 
 ```python
-from utils.job_registry import job_handler
+from common.execution_registry import execution_handler
 
-@job_handler("foo-bar")
+@execution_handler("foo-bar")
 def foo_bar(payload, state=None, ctx=None):
     text = payload.get("content", "")
     return {"result": ...}
 ```
 
-`utils/process_job.py` imports `tasks/foo_bar/foo_bar.py` for a `foo-bar` type, registering the handler in `TASK_HANDLERS`; it passes `state` and `ctx` only when declared. LLM task prompts belong in `tasks/foo_bar/prompt.md`. For long input, reuse the existing reentrant fan-out pattern: enqueue chunk jobs and resume the parent after completion.
+`utils/process_execution.py` imports `tasks/foo_bar/foo_bar.py` for a `foo-bar`
+type, registering the handler in `TASK_HANDLERS`; it passes `state` and `ctx`
+only when declared. LLM task prompts belong in `tasks/foo_bar/prompt.md`. For
+long input, reuse the reentrant fan-out pattern: enqueue child executions and
+resume the parent after completion.
 
-PostgreSQL is the only datastore: `database/job.py` handles the queue, `database/rag.py` handles pgvector embeddings, and `database/graph_db.py` handles the Apache AGE entity graph. `utils/device.py` detects CPU versus GPU; GPU dependencies are in `requirements-gpu.txt`.
+PostgreSQL is the only datastore: `database/execution.py` handles claims,
+fencing and the queue, `database/rag.py` handles pgvector embeddings, and
+`database/graph_db.py` handles the Apache AGE entity graph. `utils/device.py`
+detects CPU versus GPU; GPU dependencies are in `requirements-gpu.txt`.
