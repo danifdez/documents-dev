@@ -153,6 +153,29 @@ ensure_execution_ingest_token() {
   fi
 }
 
+ensure_models_enrollment_token() {
+  local root_env="$ROOT_DIR/.env"
+  local backend_env="$ROOT_DIR/backend/.env"
+  if [ -z "${MODELS_ENROLLMENT_TOKEN:-}" ]; then
+    command -v openssl >/dev/null 2>&1 || fail "openssl is required to generate MODELS_ENROLLMENT_TOKEN"
+    MODELS_ENROLLMENT_TOKEN="$(openssl rand -hex 32)"
+    export MODELS_ENROLLMENT_TOKEN
+    if grep -q '^MODELS_ENROLLMENT_TOKEN=' "$root_env"; then
+      sed -i "s|^MODELS_ENROLLMENT_TOKEN=.*|MODELS_ENROLLMENT_TOKEN=$MODELS_ENROLLMENT_TOKEN|" "$root_env"
+    else
+      printf '\nMODELS_ENROLLMENT_TOKEN=%s\n' "$MODELS_ENROLLMENT_TOKEN" >> "$root_env"
+    fi
+    ok "Generated Models enrollment token"
+  fi
+  if [ -f "$backend_env" ]; then
+    if grep -q '^MODELS_ENROLLMENT_TOKEN=' "$backend_env"; then
+      sed -i "s|^MODELS_ENROLLMENT_TOKEN=.*|MODELS_ENROLLMENT_TOKEN=$MODELS_ENROLLMENT_TOKEN|" "$backend_env"
+    else
+      printf '\nMODELS_ENROLLMENT_TOKEN=%s\n' "$MODELS_ENROLLMENT_TOKEN" >> "$backend_env"
+    fi
+  fi
+}
+
 # Returns the docker compose services to start. The graph (Apache AGE) now lives
 # inside PostgreSQL, so the database is the only infra service.
 get_compose_services() {
@@ -585,6 +608,7 @@ cmd_install() {
   info "Generating service configuration (all features enabled)..."
   setup_service_envs
   ensure_execution_ingest_token
+  ensure_models_enrollment_token
 
   # ── Initialize profile system (default profile + documents symlink) ──
   ensure_profiles_initialized
@@ -916,6 +940,7 @@ cmd_start() {
   detect_compose
   load_env
   ensure_execution_ingest_token
+  ensure_models_enrollment_token
   ensure_profiles_initialized
   export_compose_project
   info "Active profile: $(get_active_profile)"
