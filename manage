@@ -130,29 +130,6 @@ load_env() {
   fi
 }
 
-ensure_execution_ingest_token() {
-  local root_env="$ROOT_DIR/.env"
-  local backend_env="$ROOT_DIR/backend/.env"
-  if [ -z "${EXECUTION_INGEST_TOKEN:-}" ]; then
-    command -v openssl >/dev/null 2>&1 || fail "openssl is required to generate EXECUTION_INGEST_TOKEN"
-    EXECUTION_INGEST_TOKEN="$(openssl rand -hex 32)"
-    export EXECUTION_INGEST_TOKEN
-    if grep -q '^EXECUTION_INGEST_TOKEN=' "$root_env"; then
-      sed -i "s|^EXECUTION_INGEST_TOKEN=.*|EXECUTION_INGEST_TOKEN=$EXECUTION_INGEST_TOKEN|" "$root_env"
-    else
-      printf '\nEXECUTION_INGEST_TOKEN=%s\n' "$EXECUTION_INGEST_TOKEN" >> "$root_env"
-    fi
-    ok "Generated execution ingestion token"
-  fi
-  if [ -f "$backend_env" ]; then
-    if grep -q '^EXECUTION_INGEST_TOKEN=' "$backend_env"; then
-      sed -i "s|^EXECUTION_INGEST_TOKEN=.*|EXECUTION_INGEST_TOKEN=$EXECUTION_INGEST_TOKEN|" "$backend_env"
-    else
-      printf '\nEXECUTION_INGEST_TOKEN=%s\n' "$EXECUTION_INGEST_TOKEN" >> "$backend_env"
-    fi
-  fi
-}
-
 ensure_models_enrollment_token() {
   local root_env="$ROOT_DIR/.env"
   local backend_env="$ROOT_DIR/backend/.env"
@@ -607,7 +584,6 @@ cmd_install() {
   # ── Pre-generate service configs (all features enabled, non-interactive) ──
   info "Generating service configuration (all features enabled)..."
   setup_service_envs
-  ensure_execution_ingest_token
   ensure_models_enrollment_token
 
   # ── Initialize profile system (default profile + documents symlink) ──
@@ -939,7 +915,6 @@ print_start_summary() {
 cmd_start() {
   detect_compose
   load_env
-  ensure_execution_ingest_token
   ensure_models_enrollment_token
   ensure_profiles_initialized
   export_compose_project
