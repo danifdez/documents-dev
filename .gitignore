@@ -15,6 +15,7 @@ models/venv/
 .pids
 .env
 .logs/
+.agents/
 .claude/**
 .build-staging/**
 release-assets/

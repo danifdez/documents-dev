@@ -37,14 +37,15 @@ migration-first: TypeORM `synchronize` is disabled.
 
 ## Shared rules
 
-1. Commit code in the service repository that changed (`backend/`, `frontend/`, or `models/`). Do not commit application code at the monorepo root; it stores only submodule pointers, which change only when the user asks.
+1. Create commits only when explicitly requested. When requested, commit code in the service repository that changed (`backend/`, `frontend/`, or `models/`). Do not commit application code at the monorepo root; it stores only submodule pointers, which change only when the user asks.
 2. Use English for code, comments, UI strings, errors, LLM prompts, and database labels.
 3. Make PostgreSQL changes migration-first. Every entity change needs a committed TypeORM migration; never rely on auto-sync.
 4. Use `./manage` for lifecycle operations. Do not hand-roll Docker lifecycle commands or kill service processes manually.
 5. Never run `./manage reset` or `./manage import` without explicit user confirmation. Both are destructive: they drop the schema and wipe `documents/`.
 6. Before calling a feature done, trace whether it needs coordinated backend, models, and frontend changes through the execution pipeline.
 7. Respect feature flags: `FEATURE_*` on backend, `worker.capabilities.*` on models, and router `meta.feature` plus `featureStore` on frontend.
-8. Pin every dependency version exactly. npm dependencies must have no `^` or `~` and retain the lockfile; Python requirements use `==`; Docker and runtime versions must not use `latest` or floating ranges.
+8. Pin every new or updated dependency version exactly. npm dependencies must have no `^` or `~` and retain the lockfile; Python requirements use `==`; Docker and runtime versions must not use `latest` or floating ranges.
+9. Before calling a code change done, inspect the diff in the monorepo root and every affected service, run checks proportional to the changed behavior, and report any relevant checks that were skipped.
 
 ## Lifecycle
 
