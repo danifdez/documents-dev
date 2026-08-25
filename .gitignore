@@ -9,9 +9,6 @@ playground/**
 .github/**
 /development/**
 models/venv/
-.backend.log
-.models.log
-.llama.log
 .pids
 .env
 .logs/
