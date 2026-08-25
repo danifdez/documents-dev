@@ -1,11 +1,7 @@
 documents
 documents-archive
 .profiles/
-playground/.ipynb_checkpoints
-playground/.Trash-1000
-playground/models
 **/__pycache__/**
-playground/**
 .github/**
 /development/**
 models/venv/

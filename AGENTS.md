@@ -56,7 +56,7 @@ Run these from the monorepo root:
 ./manage start          # infrastructure, backend, and models worker
 cd frontend && npm start  # frontend is not started by manage start
 ./manage stop
-./manage logs backend|models|playground
+./manage logs backend|models
 ./manage profile:list|create|switch|...
 ```
 

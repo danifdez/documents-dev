@@ -492,7 +492,7 @@ start_log_watchdog() {
   (
     while true; do
       sleep "$LOG_CHECK_INTERVAL"
-      for logfile in "$ROOT_DIR"/.backend.log "$ROOT_DIR"/.models.log "$ROOT_DIR"/.llama.log "$ROOT_DIR"/.playground.log; do
+      for logfile in "$ROOT_DIR"/.backend.log "$ROOT_DIR"/.models.log "$ROOT_DIR"/.llama.log; do
         if [ -f "$logfile" ]; then
           size=$(stat -c%s "$logfile" 2>/dev/null || echo 0)
           if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
@@ -656,32 +656,6 @@ ensure_log_watchdog() {
   start_log_watchdog
   save_pidfile
   ok "Log watchdog started (rotates at ${MAX_LOG_SIZE} bytes, checks every ${LOG_CHECK_INTERVAL}s)"
-}
-
-# ── Keep playground's venv absolute paths in sync with where this checkout
-# actually lives. `python -m venv` bakes the venv's absolute path into
-# pyvenv.cfg and bin/activate*; if the project directory is ever moved or
-# renamed after the venv was created, those baked-in paths go stale and
-# `source .venv/bin/activate` silently fails to put a working `python` on
-# PATH. Detect and self-heal right before activating — regenerating just the
-# scripts (no --clear) never touches already-installed packages.
-#
-# This is for playground only: it lives inside this monorepo, not as its own
-# checkout. backend/models/frontend are separate submodules that can each be
-# installed and run standalone on their own machine, so the same self-healing
-# for their venvs lives in their own install/ensure-venv (see models/), and
-# manage just calls into it — this script only orchestrates, it doesn't own
-# a submodule's environment.
-ensure_playground_venv_aligned() {
-  local venv_dir="$1" activate
-  activate="$venv_dir/bin/activate"
-  [ -f "$activate" ] || return 0
-  grep -qF "VIRTUAL_ENV=$venv_dir" "$activate" 2>/dev/null && return 0
-  warn "Virtualenv at $venv_dir has stale absolute paths (checkout was moved) — realigning..."
-  local py_bin
-  py_bin=$(command -v python3 || command -v python)
-  "$py_bin" -m venv "$venv_dir"
-  ok "Realigned $venv_dir"
 }
 
 start_llama() {
@@ -1144,78 +1118,6 @@ cmd_reset() {
 }
 
 # ════════════════════════════════════════════════════════════════════
-# PLAYGROUND START
-# ════════════════════════════════════════════════════════════════════
-cmd_playground_start() {
-  local PLAYGROUND_DIR="$ROOT_DIR/playground"
-
-  if [ ! -d "$PLAYGROUND_DIR" ]; then
-    fail "playground/ directory not found."
-  fi
-
-  # ── Create .venv if missing ──
-  cd "$PLAYGROUND_DIR"
-  if [ ! -d ".venv" ]; then
-    info "Creating Python virtual environment for playground..."
-    python3 -m venv .venv
-    ok "Created .venv at playground/.venv"
-
-    info "Installing playground dependencies (this may take a while)..."
-    source .venv/bin/activate
-    pip install --upgrade pip
-    pip install -r requirements.txt
-    deactivate
-    ok "Playground dependencies installed"
-  fi
-
-  # ── Start Jupyter ──
-  ensure_log_dir
-  rotate_log "$ROOT_DIR/.playground.log"
-  info "Starting Jupyter notebook..."
-  ensure_playground_venv_aligned "$PLAYGROUND_DIR/.venv"
-  source .venv/bin/activate
-  jupyter notebook > "$ROOT_DIR/.playground.log" 2>&1 &
-  PLAYGROUND_PID=$!
-  deactivate
-  cd "$ROOT_DIR"
-
-  # ── Save PID ──
-  echo "PLAYGROUND_PID=$PLAYGROUND_PID" > "$ROOT_DIR/.playground.pid"
-
-  echo ""
-  printf "${GREEN}============================================${NC}\n"
-  printf "${GREEN}  Playground is running!${NC}\n"
-  printf "${GREEN}============================================${NC}\n"
-  echo ""
-  echo "  Jupyter:   http://localhost:8888  (PID: $PLAYGROUND_PID)"
-  echo "  Log:       tail -f .playground.log"
-  echo ""
-  echo "  Stop:      bash manage.sh playground:stop"
-  echo ""
-}
-
-# ════════════════════════════════════════════════════════════════════
-# PLAYGROUND STOP
-# ════════════════════════════════════════════════════════════════════
-cmd_playground_stop() {
-  local PGPIDFILE="$ROOT_DIR/.playground.pid"
-
-  if [ -f "$PGPIDFILE" ]; then
-    source "$PGPIDFILE"
-    if [ -n "${PLAYGROUND_PID:-}" ] && kill -0 "$PLAYGROUND_PID" 2>/dev/null; then
-      kill "$PLAYGROUND_PID" 2>/dev/null || true
-      ok "Playground stopped (PID: $PLAYGROUND_PID)"
-    else
-      warn "Playground process (PID: ${PLAYGROUND_PID:-?}) is not running."
-    fi
-    rm -f "$PGPIDFILE"
-  else
-    warn "No playground PID file found. Trying to find process..."
-    pkill -f "jupyter-notebook" 2>/dev/null && ok "Jupyter process killed" || warn "No jupyter process found."
-  fi
-}
-
-# ════════════════════════════════════════════════════════════════════
 # LOGS
 # ════════════════════════════════════════════════════════════════════
 cmd_logs() {
@@ -1226,8 +1128,7 @@ cmd_logs() {
     backend)    LOGFILE="$ROOT_DIR/.backend.log" ;;
     models)     LOGFILE="$ROOT_DIR/.models.log" ;;
     llama)      LOGFILE="$LLAMA_LOG" ;;
-    playground) LOGFILE="$ROOT_DIR/.playground.log" ;;
-    *)          fail "Usage: $0 logs <backend|models|llama|playground>" ;;
+    *)          fail "Usage: $0 logs <backend|models|llama>" ;;
   esac
 
   [ -f "$LOGFILE" ] || fail "Log file not found: $LOGFILE. Is the service running?"
@@ -1801,11 +1702,7 @@ Commands:
   reset [--yes]           Permanently delete all project data and re-initialize.
                           --yes  Skip confirmation prompt
 
-  playground:start        Start the Jupyter playground (local .venv)
-
-  playground:stop         Stop the Jupyter playground
-
-  logs <service>          Tail logs for a service (backend, models, llama, playground)
+  logs <service>          Tail logs for a service (backend, models, llama)
 
   export [output_file]    Create a compressed backup of the active profile's database and documents.
 
@@ -1857,8 +1754,6 @@ case "$COMMAND" in
   start)              cmd_start "$@" ;;
   stop)               cmd_stop "$@" ;;
   reset)              cmd_reset "$@" ;;
-  playground:start)   cmd_playground_start "$@" ;;
-  playground:stop)    cmd_playground_stop "$@" ;;
   logs)               cmd_logs "$@" ;;
   export)             cmd_export "$@" ;;
   import)             cmd_import "$@" ;;

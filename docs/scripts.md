@@ -8,7 +8,7 @@ The `manage` script is the primary development tool for the repository. It handl
 
 - **Docker** and **Docker Compose** (v2 plugin or standalone `docker-compose`) — auto-detected
 - **Node.js** and **npm** — for backend and frontend
-- **Python 3** and `python3 -m venv` — for models and playground
+- **Python 3** and `python3 -m venv` — for models
 - `pg_dump` / `psql` — for `export` and `import` commands (must be available on the host)
 
 ### Commands
@@ -77,15 +77,6 @@ Actions performed:
 
 > **Destructive operation** — use with care.
 
-#### `playground:start` / `playground:stop`
-
-Starts or stops the Jupyter notebook server. See [playground.md](playground.md) for details.
-
-```bash
-bash manage playground:start
-bash manage playground:stop
-```
-
 #### `logs <service>`
 
 Tails the log file for a running service.
@@ -93,10 +84,9 @@ Tails the log file for a running service.
 ```bash
 bash manage logs backend
 bash manage logs models
-bash manage logs playground
 ```
 
-Log files are stored as hidden files in the repository root (`.backend.log`, `.models.log`, `.playground.log`). They are rotated automatically at 10 MB, keeping up to 3 backups in `.logs/`.
+Log files are stored as hidden files in the repository root (`.backend.log`, `.models.log`). They are rotated automatically at 10 MB, keeping up to 3 backups in `.logs/`.
 
 #### `export [output_file]`
 
