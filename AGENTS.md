@@ -14,21 +14,21 @@ Documents is a development monorepo that orchestrates three services, each with 
 
 ### Execution pipeline
 
-A feature commonly spans all three services through PostgreSQL's `executions`
-table. Queueing is a capability of `Execution`, not a separate domain:
+A feature commonly spans all three services through Backend's durable execution
+control plane:
 
 ```text
 frontend (Vue service → HTTP)
   → backend creates or processes an execution
-  → models worker polls and handles heavy ML executions
-  → result is written to the execution row
-  → backend reads it and emits Socket.io notifications
+  → models worker claims a fenced step over authenticated HTTP
+  → result is acknowledged and finalized by backend
+  → backend emits Socket.io notifications through its outbox
   → frontend receives the notification and updates the UI
 ```
 
 - Backend owns finalization through `ExecutionProcessorFactory`.
 - Models owns heavy ML types. Each handler is `tasks/<type>/<type>.py`, decorated with `@execution_handler("<type>")` and enabled in `models/config/tasks.json`.
-- Both services poll the same table. `FOR UPDATE SKIP LOCKED` prevents collisions.
+- Only Backend accesses execution tables; Models uses the worker protocol.
 - `backend/src/model/model.service.ts` is the backend-to-models bridge.
 
 PostgreSQL holds application data, executions and their append-only evidence,
@@ -148,26 +148,27 @@ A screen change includes its page, route (with `meta.feature` when gated), store
 
 ## Models (`models/`)
 
-Python polling worker that consumes PostgreSQL executions.
+Python worker that executes self-contained assignments granted by Backend.
 
 ### Rules
 
 1. An execution type `foo-bar` requires `tasks/foo_bar/foo_bar.py`, a handler decorated as `@execution_handler("foo-bar")`, and an enabled entry in `config/tasks.json`. Missing any one makes the worker silently skip it.
-2. Return a dictionary: it is written verbatim to the execution row and read by the backend, so keep its shape stable.
+2. Return a dictionary: it becomes the typed `StepResult` value consumed by Backend, so keep its shape stable.
 3. For iteration without loading large models, disable capabilities in `config/config.json` with `worker.disable_llm` or `worker.disable_embeddings`.
-4. The standard-library tests live in `tests/`; the PostgreSQL execution test is opt-in through `RUN_EXECUTION_POSTGRES_E2E=1`.
+4. The standard-library tests live in `tests/`.
+5. Never open PostgreSQL, pgvector or AGE from Models. Backend supplies domain snapshots through payloads/artifacts and persists validated effects.
 
 ### Commands
 
 ```bash
 python executions.py
-python executions.py --setup
 ```
 
-`executions.py` polls approximately every second, atomically claims an
-execution with a fenced `attemptId`, dispatches by type, and writes checkpoint
-and result back. Backend owns terminal finalization after applying effects. Its
-configuration is `config/config.json` merged over `common/config.default.json`.
+`executions.py` registers the worker, claims compatible steps over HTTP,
+downloads attempt-scoped artifacts, renews leases and retries result delivery
+until Backend returns a terminal ACK. Backend owns terminal finalization and
+all domain effects. Configuration is `config/config.json` merged over
+`common/config.default.json`.
 
 ### Task pattern and connections
 
@@ -180,13 +181,9 @@ def foo_bar(payload, state=None, ctx=None):
     return {"result": ...}
 ```
 
-`utils/process_execution.py` imports `tasks/foo_bar/foo_bar.py` for a `foo-bar`
-type, registering the handler in `TASK_HANDLERS`; it passes `state` and `ctx`
-only when declared. LLM task prompts belong in `tasks/foo_bar/prompt.md`. For
-long input, reuse the reentrant fan-out pattern: enqueue child executions and
-resume the parent after completion.
-
-PostgreSQL is the only datastore: `database/execution.py` handles claims,
-fencing and the queue, `database/rag.py` handles pgvector embeddings, and
-`database/graph_db.py` handles the Apache AGE entity graph. `utils/device.py`
-detects CPU versus GPU; GPU dependencies are in `requirements-gpu.txt`.
+`utils/task_dispatch.py` imports `tasks/foo_bar/foo_bar.py` for a `foo-bar`
+type and registers it in `TASK_HANDLERS`. LLM task prompts belong in
+`tasks/foo_bar/prompt.md`. Backend owns fan-out/fan-in and passes ordered
+partials to reduce steps. Vector searches receive a bounded
+`vector_candidates` artifact and rank it locally. `utils/device.py` detects CPU
+versus GPU; GPU dependencies are in `requirements-gpu.txt`.
