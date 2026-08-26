@@ -170,7 +170,8 @@ python executions.py
 downloads attempt-scoped artifacts, renews leases and retries result delivery
 until Backend returns a terminal ACK. Backend owns terminal finalization and
 all domain effects. Output artifacts are uploaded before their fenced result
-is submitted. Configuration is `config/config.json` merged over
+is submitted. The current sequential worker declares one concurrency slot;
+Backend enforces it from live attempts. Configuration is `config/config.json` merged over
 `common/config.default.json`.
 
 ### Task pattern and connections
