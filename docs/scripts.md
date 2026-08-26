@@ -39,7 +39,7 @@ bash manage start
 
 - Starts PostgreSQL (Docker)
 - Launches the backend (`npm run start:dev`) in the background
-- Launches the models worker (`python jobs.py`) in the background
+- Launches the models worker (`python executions.py`) in the background
 - Saves process IDs to `.pids` and rotates log files if they exceed 10 MB
 
 The frontend is not started automatically; run it separately:

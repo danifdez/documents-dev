@@ -153,7 +153,9 @@ Python worker that executes self-contained assignments granted by Backend.
 ### Rules
 
 1. An execution type `foo-bar` requires `tasks/foo_bar/foo_bar.py`, a handler decorated as `@execution_handler("foo-bar")`, and an enabled entry in `config/tasks.json`. Missing any one makes the worker silently skip it.
-2. Return a dictionary: it becomes the typed `StepResult` value consumed by Backend, so keep its shape stable.
+2. Return a dictionary for small typed results. Large calculated bodies use
+   `HandlerOutput` and attempt-scoped output artifacts; keep both the result and
+   artifact shapes stable.
 3. For iteration without loading large models, disable capabilities in `config/config.json` with `worker.disable_llm` or `worker.disable_embeddings`.
 4. The standard-library tests live in `tests/`.
 5. Never open PostgreSQL, pgvector or AGE from Models. Backend supplies domain snapshots through payloads/artifacts and persists validated effects.
@@ -167,7 +169,8 @@ python executions.py
 `executions.py` registers the worker, claims compatible steps over HTTP,
 downloads attempt-scoped artifacts, renews leases and retries result delivery
 until Backend returns a terminal ACK. Backend owns terminal finalization and
-all domain effects. Configuration is `config/config.json` merged over
+all domain effects. Output artifacts are uploaded before their fenced result
+is submitted. Configuration is `config/config.json` merged over
 `common/config.default.json`.
 
 ### Task pattern and connections

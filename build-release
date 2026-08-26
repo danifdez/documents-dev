@@ -413,7 +413,6 @@ ${BOLD}Test standalone locally (without GitHub):${NC}
   3. ./build-release models-cpu         # ~2 GB, slow (downloads deps)
   4. ./build-release serve              # serves release-assets/ on :8000
   5. cd frontend && DOCUMENTS_RELEASE_BASE_URL=http://localhost:8000 npm start
-     (Neo4j still comes from its official source — needs internet)
 
 ${BOLD}Covering "any machine":${NC}
   Each models variant builds in its own venv with its own deps (CPU vs CUDA).
@@ -427,9 +426,6 @@ ${BOLD}Workflow:${NC}
   2. Upload release-assets/ to GitHub Releases
   3. ./build-release installer     # Build the lightweight installer
   4. Distribute the installer
-
-${BOLD}What the app downloads at runtime (from official sources):${NC}
-  Neo4j          ~60 MB    from dist.neo4j.org
 
 ${BOLD}What we host on GitHub Releases:${NC}
   Backend        ~50 MB    compiled NestJS + node_modules

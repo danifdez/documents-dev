@@ -36,11 +36,17 @@ Document embeddings (semantic search and RAG) live in PostgreSQL via the `vector
 | `indexed_file_chunks` | Files in the assistant's working folder |
 | `memory_vectors` | Assistant memory (1-to-1 with memory entries) |
 
-The extension and the tables are created by a backend TypeORM migration (`CreateVectorTables`), following the migration-first schema rule. The models worker reads and writes these tables directly with `psycopg` and the `pgvector` package.
+The extension and tables are created by a Backend TypeORM migration
+(`CreateVectorTables`), following the migration-first schema rule. Backend is
+their only application owner: Models receives bounded snapshots and returns
+attempt-scoped output artifacts, which Backend validates before persisting.
 
 ## Shared Document Storage
 
-The `./documents/` directory at the repository root is mounted into both `backend` and `models` containers. It stores uploaded and processed documents, organized by resource/job IDs. This directory is gitignored.
+The `./documents/` directory at the repository root stores uploaded and
+processed documents, organized by resource IDs. Backend owns filesystem access;
+Models receives required bodies through attempt-scoped artifacts. This
+directory is gitignored.
 
 ## Named Volumes
 

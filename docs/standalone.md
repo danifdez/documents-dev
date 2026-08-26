@@ -30,10 +30,9 @@ selects standalone mode for the first time. No additional action is required.
 | Service | Approximate size | Source |
 |---------|-----------------|--------|
 | Backend (NestJS API) | ~50 MB | GitHub Releases |
-| PostgreSQL 17.6 + pgvector | ~200 MB | GitHub Releases |
-| Neo4j 5 | ~60 MB | dist.neo4j.org |
+| PostgreSQL 17.6 + pgvector + Apache AGE | ~200 MB | GitHub Releases |
 
-**Total: ~310 MB.** The download happens once and the files are stored in the
+**Total: ~250 MB.** The download happens once and the files are stored in the
 application's user-data directory.
 
 Document embeddings (semantic search / RAG) are stored in PostgreSQL via the
@@ -41,6 +40,7 @@ Document embeddings (semantic search / RAG) are stored in PostgreSQL via the
 embedded PostgreSQL is the zonky binaries repackaged with pgvector baked in
 (`./build-release postgres`, which pulls the prebuilt extension `.deb` from the
 PostgreSQL APT repository), so the server has vector support out of the box.
+The same database includes Apache AGE for the entity graph.
 
 ## Optional AI Features
 
@@ -62,9 +62,8 @@ appropriate variant automatically.
 When a local workspace is started the services are launched in this order:
 
 1. **PostgreSQL** — relational database for application data, including document
-   embeddings via pgvector (required).
-2. **Neo4j** — graph database for knowledge relationships (started if installed).
-3. **Backend** — REST API that connects the frontend to the databases.
+   embeddings via pgvector and the entity graph via Apache AGE (required).
+2. **Backend** — REST API that owns and exposes the database state.
 
 The application is ready when the backend reports that it is running. All services
 are stopped automatically when the application is closed.

@@ -90,32 +90,16 @@ setup_service_envs() {
     ok "Created frontend/.env"
   fi
 
-  # Models: config.json from defaults, patched with the DB connection. Vectors
-  # live in Postgres (pgvector), so no separate vector-store config is needed.
+  # Models: self-contained worker configuration. Backend is the only service
+  # that receives database credentials.
   local mcfg="$ROOT_DIR/models/config/config.json"
   if [ -f "$mcfg" ]; then
     ok "models/config/config.json already exists (skipping)"
   else
     mkdir -p "$ROOT_DIR/models/config/tasks"
-    POSTGRES_HOST="${POSTGRES_HOST:-localhost}" POSTGRES_PORT="${POSTGRES_PORT:-5432}" \
-    POSTGRES_DB="${POSTGRES_DB:-documents}" POSTGRES_USER="${POSTGRES_USER:-postgres}" \
-    POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-example}" python3 - "$ROOT_DIR/models" <<'PY'
-import json, os, shutil, sys
-root = sys.argv[1]
-cfg = json.load(open(os.path.join(root, 'common/config.default.json')))
-cfg['database'].update({
-    'host': os.environ['POSTGRES_HOST'],
-    'port': int(os.environ['POSTGRES_PORT']),
-    'name': os.environ['POSTGRES_DB'],
-    'user': os.environ['POSTGRES_USER'],
-    'password': os.environ['POSTGRES_PASSWORD'],
-})
-with open(os.path.join(root, 'config/config.json'), 'w') as f:
-    json.dump(cfg, f, indent=2)
-    f.write('\n')
-shutil.copy(os.path.join(root, 'common/tasks.default.json'),
-            os.path.join(root, 'config/tasks.json'))
-PY
+    cp "$ROOT_DIR/models/common/config.default.json" "$mcfg"
+    cp "$ROOT_DIR/models/common/tasks.default.json" \
+      "$ROOT_DIR/models/config/tasks.json"
     ok "Created models/config/config.json + tasks.json (all features enabled)"
   fi
 }
@@ -275,8 +259,7 @@ archive_dir_is_in_profile() {
   [ "$in_profile_abs" = "$configured_abs" ]
 }
 
-# Migrate pre-profile state (legacy volumes + plain documents/ dir) into a 'default' profile.
-# Idempotent; no-op once .profiles/.active exists.
+# Initialize the default profile once.
 ensure_profiles_initialized() {
   if [ -f "$PROFILES_DIR/.active" ]; then
     return 0
@@ -284,37 +267,6 @@ ensure_profiles_initialized() {
 
   info "Initializing data profile system..."
   mkdir -p "$PROFILES_DIR/default" "$PROFILES_DIR/default/documents-archive" "$PROFILES_DIR/archived"
-
-  # Move any existing documents into the default profile
-  if [ -d "$ROOT_DIR/documents" ] && [ ! -L "$ROOT_DIR/documents" ]; then
-    mkdir -p "$PROFILES_DIR/default/documents"
-    if [ -n "$(ls -A "$ROOT_DIR/documents" 2>/dev/null || true)" ]; then
-      info "  Moving existing documents/ into .profiles/default/documents/"
-      (cd "$ROOT_DIR/documents" && tar cf - .) | (cd "$PROFILES_DIR/default/documents" && tar xf -)
-      rm -rf "$ROOT_DIR/documents"/*
-      find "$ROOT_DIR/documents" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-    fi
-    rmdir "$ROOT_DIR/documents" 2>/dev/null || rm -rf "$ROOT_DIR/documents"
-  fi
-
-  # Stop any containers left from the pre-profile layout (container_name: database/neo4j)
-  for c in database neo4j; do
-    if docker ps -a --format '{{.Names}}' | grep -qx "$c"; then
-      info "  Removing legacy container: $c"
-      docker rm -f "$c" >/dev/null 2>&1 || true
-    fi
-  done
-
-  # Rename legacy volumes (documents-dev_*) to the new profile-scoped names
-  for suffix in database-data neo4j_data; do
-    local legacy="documents-dev_${suffix}"
-    local target="$(profile_volume_name default "$suffix")"
-    if docker volume inspect "$legacy" >/dev/null 2>&1 && ! docker volume inspect "$target" >/dev/null 2>&1; then
-      info "  Migrating volume: $legacy -> $target"
-      clone_docker_volume "$legacy" "$target"
-      docker volume rm "$legacy" >/dev/null 2>&1 || warn "Could not remove legacy volume $legacy"
-    fi
-  done
 
   # Write metadata for default profile
   cat > "$PROFILES_DIR/default/metadata.json" <<METAEOF
@@ -1415,7 +1367,7 @@ cmd_profile_create() {
       warn "  DOCUMENTS_ARCHIVE_DIR is set to an external path; archived files for '$src' are NOT cloned."
     fi
     # Clone volumes
-    for suffix in database-data neo4j_data; do
+    for suffix in database-data; do
       local src_vol dst_vol
       src_vol="$(profile_volume_name "$src" "$suffix")"
       dst_vol="$(profile_volume_name "$name" "$suffix")"
@@ -1514,7 +1466,7 @@ cmd_profile_delete() {
     [ "$confirm" = "DELETE" ] || { echo "Aborted."; exit 1; }
   fi
 
-  for suffix in database-data neo4j_data; do
+  for suffix in database-data; do
     local vol
     vol="$(profile_volume_name "$name" "$suffix")"
     if docker volume inspect "$vol" >/dev/null 2>&1; then
@@ -1542,7 +1494,7 @@ cmd_profile_rename() {
 
   info "Renaming profile: $old -> $new"
   # Rename volumes (must be done by create+copy+delete)
-  for suffix in database-data neo4j_data; do
+  for suffix in database-data; do
     local src_vol dst_vol
     src_vol="$(profile_volume_name "$old" "$suffix")"
     dst_vol="$(profile_volume_name "$new" "$suffix")"
@@ -1594,7 +1546,7 @@ cmd_profile_archive() {
   fi
   cp "$PROFILES_DIR/$name/metadata.json" "$TMPDIR/metadata.json" 2>/dev/null || true
 
-  for suffix in database-data neo4j_data; do
+  for suffix in database-data; do
     local vol
     vol="$(profile_volume_name "$name" "$suffix")"
     if docker volume inspect "$vol" >/dev/null 2>&1; then
@@ -1609,7 +1561,7 @@ cmd_profile_archive() {
   tar -czf "$out" -C "$TMPDIR" .
 
   # Remove live profile state
-  for suffix in database-data neo4j_data; do
+  for suffix in database-data; do
     local vol
     vol="$(profile_volume_name "$name" "$suffix")"
     docker volume rm "$vol" >/dev/null 2>&1 || true
@@ -1655,7 +1607,7 @@ cmd_profile_restore() {
 METAEOF
   fi
 
-  for suffix in database-data neo4j_data; do
+  for suffix in database-data; do
     if [ -f "$TMPDIR/${suffix}.tar" ]; then
       local vol
       vol="$(profile_volume_name "$name" "$suffix")"
