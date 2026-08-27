@@ -334,10 +334,8 @@ MAX_LOG_SIZE=$((10 * 1024 * 1024))  # 10MB per log file
 LOG_CHECK_INTERVAL=60                # check every 60 seconds
 
 # ── Inference engine (llama-server) ─────────────────────────────────
-# There is one engine on the machine and it belongs to documents-dev. The models
-# worker, the backend and the embedded browser all generate through it over HTTP
-# instead of each loading the weights: one copy of the model in memory, one queue,
-# so the chat doesn't wait behind whatever the indexer is doing.
+# This engine belongs to Models. Backend only orchestrates executions and neither
+# Backend nor IA Browser discovers or uses this endpoint.
 #
 # It lives in models/bin/llama/ and is started like any other service here. The models
 # worker knows how to start it too, as a last resort when an execution needs the LLM and
@@ -656,8 +654,8 @@ start_llama() {
   source_pidfile
   local url; url="$(llama_url)"
 
-  # Somebody else's engine already answers there — a browser build, a manual run,
-  # a remote one. Sharing is the whole point, so use it and start nothing.
+  # A configured local or remote engine already answers there, so Models can use
+  # it and manage must not start a duplicate process.
   if llama_is_alive "$url"; then
     ok "Inference engine already answering at $url ($(llama_served_model "$url"))"
     return 0
@@ -1016,8 +1014,8 @@ cmd_stop() {
   kill_by_pattern "python executions.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
   kill_by_pattern "voice.run_pool" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
   kill_by_pattern "voice.run_live_worker" "voice orphan" "$ROOT_DIR/models" 2>/dev/null || true
-  # Only the engine on our port: another llama-server on this machine (the
-  # browser's own, a manual one) is not ours to kill.
+  # Only the Models engine on our configured port; unrelated llama-server
+  # processes on other ports are not ours to stop.
   kill_by_pattern "llama-server .*--port $(llama_port)" "engine orphan" 2>/dev/null || true
 
   local port_pid
@@ -1766,13 +1764,12 @@ Commands:
   help                    Show this help message.
 
 Notes:
-  One inference engine, shared. Everything that generates text — the models
-  worker executions, and the embedded browser through the URL the backend announces
-  in /auth/status — talks to the llama-server in bin/llama. Nothing loads the
-  weights in-process any more. Point it elsewhere (a build with CUDA, another
-  machine) with LLAMA_SERVER_URL / LLAMA_SERVER_BIN in backend/.env; what it
-  serves comes from models/config/config.json (llm_defaults) and the model most
-  task configs name.
+  Models worker executions are the only callers of the llama-server in
+  models/bin/llama. Connected IA Browser routes inference through Backend;
+  autonomous IA Browser manages its own runtime.
+  Configure Models with LLAMA_SERVER_URL / LLAMA_SERVER_BIN in models/.env; the
+  served model comes from models/config/config.json (llm_defaults) and the model
+  named by each task configuration.
 
   Each profile has three file stores:
     - documents/            Hot storage (active resource files).

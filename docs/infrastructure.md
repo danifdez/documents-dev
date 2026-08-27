@@ -28,13 +28,12 @@ docker compose logs database
 
 ## Vector Storage (pgvector)
 
-Document embeddings (semantic search and RAG) live in PostgreSQL via the `vector` (pgvector) extension — there is no separate vector service. Embeddings are E5 multilingual vectors (384 dimensions, cosine distance) stored across three tables, each scoped to a different domain for physical isolation:
+Document embeddings (semantic search and RAG) live in PostgreSQL via the `vector` (pgvector) extension — there is no separate vector service. Embeddings are E5 multilingual vectors (384 dimensions, cosine distance) stored across two tables, each scoped to a different domain for physical isolation:
 
 | Table | Scope |
 |-------|-------|
 | `rag_chunks` | Workspace RAG (resources, docs, knowledge) |
-| `indexed_file_chunks` | Files in the assistant's working folder |
-| `memory_vectors` | Assistant memory (1-to-1 with memory entries) |
+| `indexed_file_chunks` | Files in assistant or agent working folders |
 
 The extension and tables are created by a Backend TypeORM migration
 (`CreateVectorTables`), following the migration-first schema rule. Backend is
