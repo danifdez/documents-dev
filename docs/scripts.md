@@ -71,7 +71,7 @@ Actions performed:
 
 1. Stops all running services
 2. Drops all PostgreSQL tables (`DROP SCHEMA public CASCADE`) — this also removes the vector tables, which are recreated on re-migration
-3. Deletes all files in `./documents/`
+3. Deletes active-profile files in `./documents/`, `./documents-archive/`, and `./execution-artifacts/` when those stores are profile-managed
 4. Removes the frontend user configuration (`~/.config/documents-frontend`)
 5. Re-runs database migrations
 
@@ -90,14 +90,14 @@ Log files are stored as hidden files in the repository root (`.backend.log`, `.m
 
 #### `export [output_file]`
 
-Creates a compressed backup of the PostgreSQL database and the `documents/` folder.
+Creates a compressed backup of PostgreSQL and the active profile's managed filesystem stores.
 
 ```bash
 bash manage export                              # auto-named backup_YYYYMMDD_HHMMSS.tar.gz
 bash manage export /path/to/my_backup.tar.gz
 ```
 
-The archive contains `database.sql`, the `documents/` directory, and `backup_metadata.json`.
+The archive contains `database.sql`, `documents/`, `documents-archive/`, `execution-artifacts/`, and `backup_metadata.json`. Storage paths configured outside the active profile must be backed up separately.
 
 #### `import <backup_file>`
 
@@ -107,7 +107,7 @@ Restores a backup created by `export`.
 bash manage import backup_20260101_120000.tar.gz
 ```
 
-> **Destructive operation** — replaces the current database and documents. Prompts for confirmation (type IMPORT).
+> **Destructive operation** — replaces the current database, documents, and managed execution artifacts. Prompts for confirmation (type IMPORT).
 
 #### `help`
 

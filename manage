@@ -143,7 +143,7 @@ get_compose_services() {
   echo "database"
 }
 
-# ── Data profiles (versioned DB + documents) ────────────────────────
+# ── Data profiles (database + filesystem stores) ────────────────────
 PROFILES_DIR="$ROOT_DIR/.profiles"
 
 get_active_profile() {
@@ -211,7 +211,7 @@ volume_size_human() {
   docker run --rm -v "${vol}:/v:ro" alpine sh -c 'du -sh /v 2>/dev/null | cut -f1' 2>/dev/null || echo "?"
 }
 
-# Ensure the documents/ entry is a symlink to the active profile's folder
+# Ensure filesystem-backed data entries point to the active profile.
 refresh_documents_symlink() {
   local profile="$1"
   local target_rel=".profiles/${profile}/documents"
@@ -244,29 +244,71 @@ refresh_documents_symlink() {
     fi
   fi
   ln -s "$archive_target_rel" "$ROOT_DIR/documents-archive"
+
+  local artifacts_target_rel=".profiles/${profile}/execution-artifacts"
+  local artifacts_target_abs="$PROFILES_DIR/${profile}/execution-artifacts"
+  mkdir -p "$artifacts_target_abs"
+
+  if [ -L "$ROOT_DIR/execution-artifacts" ]; then
+    rm -f "$ROOT_DIR/execution-artifacts"
+  elif [ -d "$ROOT_DIR/execution-artifacts" ]; then
+    if [ -z "$(ls -A "$ROOT_DIR/execution-artifacts" 2>/dev/null || true)" ]; then
+      rmdir "$ROOT_DIR/execution-artifacts"
+    else
+      fail "execution-artifacts/ exists as a real directory with content. Move it into .profiles/<profile>/execution-artifacts/ manually before continuing."
+    fi
+  fi
+  ln -s "$artifacts_target_rel" "$ROOT_DIR/execution-artifacts"
+}
+
+backend_configured_path() {
+  local name="$1" value="${!1:-}"
+  if [ -z "$value" ] && [ -f "$ROOT_DIR/backend/.env" ]; then
+    value="$(sed -n "s/^${name}=//p" "$ROOT_DIR/backend/.env" | tail -1)"
+  fi
+  [ -n "$value" ] || return 1
+  case "$value" in
+    /*) ;;
+    *) value="$ROOT_DIR/backend/$value" ;;
+  esac
+  realpath -ms "$value" 2>/dev/null || echo "$value"
 }
 
 # Returns 0 if DOCUMENTS_ARCHIVE_DIR points inside the profile (default), 1 if it's external.
 # When external, the manage profile commands won't include archived files in the bundle.
 archive_dir_is_in_profile() {
-  local profile="$1"
-  if [ -z "${DOCUMENTS_ARCHIVE_DIR:-}" ]; then
-    return 0
-  fi
-  local in_profile_abs configured_abs
+  local profile="$1" in_profile_abs configured_abs
   in_profile_abs="$(cd "$PROFILES_DIR/${profile}" 2>/dev/null && pwd)/documents-archive"
-  configured_abs="$(realpath -m "$DOCUMENTS_ARCHIVE_DIR" 2>/dev/null || echo "$DOCUMENTS_ARCHIVE_DIR")"
-  [ "$in_profile_abs" = "$configured_abs" ]
+  configured_abs="$(backend_configured_path DOCUMENTS_ARCHIVE_DIR || true)"
+  [ -z "$configured_abs" ] ||
+    [ "$ROOT_DIR/documents-archive" = "$configured_abs" ] ||
+    [ "$in_profile_abs" = "$configured_abs" ]
+}
+
+# Returns 0 when execution artifacts use the profile directory, 1 when external.
+artifact_dir_is_in_profile() {
+  local profile="$1" in_profile_abs configured_abs
+  in_profile_abs="$(cd "$PROFILES_DIR/${profile}" 2>/dev/null && pwd)/execution-artifacts"
+  configured_abs="$(backend_configured_path EXECUTION_ARTIFACT_STORAGE_DIR || true)"
+  [ -z "$configured_abs" ] ||
+    [ "$ROOT_DIR/execution-artifacts" = "$configured_abs" ] ||
+    [ "$in_profile_abs" = "$configured_abs" ]
 }
 
 # Initialize the default profile once.
 ensure_profiles_initialized() {
   if [ -f "$PROFILES_DIR/.active" ]; then
+    local active_profile
+    active_profile="$(get_active_profile)"
+    mkdir -p "$PROFILES_DIR/$active_profile/documents" "$PROFILES_DIR/$active_profile/documents-archive" "$PROFILES_DIR/$active_profile/execution-artifacts"
+    if [ ! -L "$ROOT_DIR/execution-artifacts" ]; then
+      refresh_documents_symlink "$active_profile"
+    fi
     return 0
   fi
 
   info "Initializing data profile system..."
-  mkdir -p "$PROFILES_DIR/default" "$PROFILES_DIR/default/documents-archive" "$PROFILES_DIR/archived"
+  mkdir -p "$PROFILES_DIR/default" "$PROFILES_DIR/default/documents-archive" "$PROFILES_DIR/default/execution-artifacts" "$PROFILES_DIR/archived"
 
   # Write metadata for default profile
   cat > "$PROFILES_DIR/default/metadata.json" <<METAEOF
@@ -541,7 +583,7 @@ cmd_install() {
   # ── Initialize profile system (default profile + documents symlink) ──
   ensure_profiles_initialized
   export_compose_project
-  ok "documents/ symlink points to profile: $(get_active_profile)"
+  ok "Filesystem stores point to profile: $(get_active_profile)"
 
   # ── Start infrastructure (database) ──
   info "Starting infrastructure containers..."
@@ -1006,7 +1048,7 @@ cmd_reset() {
   done
 
   if [ "$YES" -ne 1 ]; then
-    echo "This will PERMANENTLY DELETE project data (documents, DB tables, frontend settings)."
+    echo "This will PERMANENTLY DELETE project data (managed filesystem stores, DB tables, frontend settings)."
     read -p "Type RESET to continue: " confirm
     if [ "$confirm" != "RESET" ]; then
       echo "Aborted."
@@ -1047,7 +1089,18 @@ cmd_reset() {
     find "$archive_target" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
   fi
   if ! archive_dir_is_in_profile "$(get_active_profile)"; then
-    warn "DOCUMENTS_ARCHIVE_DIR is set to an external path; files at '$DOCUMENTS_ARCHIVE_DIR' were NOT removed."
+    warn "DOCUMENTS_ARCHIVE_DIR is external; files at '$(backend_configured_path DOCUMENTS_ARCHIVE_DIR)' were NOT removed."
+  fi
+
+  local artifacts_target="$PROFILES_DIR/$(get_active_profile)/execution-artifacts"
+  echo "-- Removing execution artifacts in $artifacts_target"
+  if artifact_dir_is_in_profile "$(get_active_profile)" && [ -d "$artifacts_target" ]; then
+    rm -rf "$artifacts_target"/* 2>/dev/null || true
+    find "$artifacts_target" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+  elif ! artifact_dir_is_in_profile "$(get_active_profile)"; then
+    local configured_artifacts
+    configured_artifacts="$(backend_configured_path EXECUTION_ARTIFACT_STORAGE_DIR || true)"
+    warn "EXECUTION_ARTIFACT_STORAGE_DIR is external; files at '$configured_artifacts' were NOT removed."
   fi
 
   # (Vector tables live in Postgres and were dropped with the schema above;
@@ -1137,6 +1190,15 @@ cmd_export() {
     warn "DOCUMENTS_ARCHIVE_DIR is set to an external path; archived files are NOT included in the export."
   fi
 
+  mkdir -p "$TMPDIR/execution-artifacts"
+  if artifact_dir_is_in_profile "$(get_active_profile)" && [ -e "$ROOT_DIR/execution-artifacts" ] && [ "$(ls -A "$ROOT_DIR/execution-artifacts" 2>/dev/null)" ]; then
+    info "Copying execution artifacts folder..."
+    (cd "$ROOT_DIR/execution-artifacts" && tar cf - .) | (cd "$TMPDIR/execution-artifacts" && tar xf -)
+    ok "Execution artifacts copied"
+  elif ! artifact_dir_is_in_profile "$(get_active_profile)"; then
+    warn "EXECUTION_ARTIFACT_STORAGE_DIR is external; execution artifacts are NOT included in the export."
+  fi
+
   # ── Metadata ──
   cat > "$TMPDIR/backup_metadata.json" <<METAEOF
 {
@@ -1148,7 +1210,7 @@ METAEOF
 
   # ── Compress ──
   info "Compressing backup..."
-  tar -czf "$OUTPUT_FILE" -C "$TMPDIR" database.sql documents documents-archive backup_metadata.json
+  tar -czf "$OUTPUT_FILE" -C "$TMPDIR" database.sql documents documents-archive execution-artifacts backup_metadata.json
 
   ok "Export complete: $OUTPUT_FILE ($(du -h "$OUTPUT_FILE" | cut -f1))"
 }
@@ -1170,7 +1232,7 @@ cmd_import() {
 
   [ -f "$INPUT_FILE" ] || fail "File not found: $INPUT_FILE"
 
-  echo "This will REPLACE the current database and documents with the contents of:"
+  echo "This will REPLACE the current database and managed filesystem stores with the contents of:"
   echo "  $INPUT_FILE"
   read -p "Type IMPORT to continue: " confirm
   if [ "$confirm" != "IMPORT" ]; then
@@ -1192,6 +1254,7 @@ cmd_import() {
 
   [ -f "$TMPDIR/database.sql" ] || fail "Invalid backup: database.sql not found"
   [ -d "$TMPDIR/documents" ]    || fail "Invalid backup: documents/ not found"
+  [ -d "$TMPDIR/execution-artifacts" ] || fail "Invalid backup: execution-artifacts/ not found"
 
   # ── Ensure infrastructure is running ──
   $COMPOSE_CMD up -d
@@ -1231,6 +1294,20 @@ cmd_import() {
     else
       warn "Backup contains archived documents but DOCUMENTS_ARCHIVE_DIR is external; skipping. Move them manually if needed."
     fi
+  fi
+
+  if artifact_dir_is_in_profile "$(get_active_profile)"; then
+    info "Restoring execution artifacts folder..."
+    local artifacts_target="$PROFILES_DIR/$(get_active_profile)/execution-artifacts"
+    mkdir -p "$artifacts_target"
+    rm -rf "$artifacts_target"/* 2>/dev/null || true
+    find "$artifacts_target" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+    if [ "$(ls -A "$TMPDIR/execution-artifacts" 2>/dev/null)" ]; then
+      (cd "$TMPDIR/execution-artifacts" && tar cf - .) | (cd "$artifacts_target" && tar xf -)
+    fi
+    ok "Execution artifacts restored"
+  else
+    warn "Backup contains execution artifacts but EXECUTION_ARTIFACT_STORAGE_DIR is external; skipping. Move them manually if needed."
   fi
 
   ok "Import complete. Run 'bash manage.sh start' to start services."
@@ -1351,7 +1428,7 @@ cmd_profile_create() {
   fi
 
   info "Creating profile '$name' (mode: $mode${src:+, from: $src})..."
-  mkdir -p "$PROFILES_DIR/$name/documents" "$PROFILES_DIR/$name/documents-archive"
+  mkdir -p "$PROFILES_DIR/$name/documents" "$PROFILES_DIR/$name/documents-archive" "$PROFILES_DIR/$name/execution-artifacts"
 
   if [ "$mode" = "from" ]; then
     # Clone documents
@@ -1365,6 +1442,12 @@ cmd_profile_create() {
       (cd "$PROFILES_DIR/$src/documents-archive" && tar cf - .) | (cd "$PROFILES_DIR/$name/documents-archive" && tar xf -)
     elif ! archive_dir_is_in_profile "$src"; then
       warn "  DOCUMENTS_ARCHIVE_DIR is set to an external path; archived files for '$src' are NOT cloned."
+    fi
+    if artifact_dir_is_in_profile "$src" && [ -d "$PROFILES_DIR/$src/execution-artifacts" ] && [ -n "$(ls -A "$PROFILES_DIR/$src/execution-artifacts" 2>/dev/null || true)" ]; then
+      info "  Cloning execution artifacts..."
+      (cd "$PROFILES_DIR/$src/execution-artifacts" && tar cf - .) | (cd "$PROFILES_DIR/$name/execution-artifacts" && tar xf -)
+    elif ! artifact_dir_is_in_profile "$src"; then
+      warn "  EXECUTION_ARTIFACT_STORAGE_DIR is external; execution artifacts for '$src' are NOT cloned."
     fi
     # Clone volumes
     for suffix in database-data; do
@@ -1534,7 +1617,7 @@ cmd_profile_archive() {
   TMPDIR="$(mktemp -d)"
   trap 'rm -rf "$TMPDIR"' RETURN
 
-  mkdir -p "$TMPDIR/documents" "$TMPDIR/documents-archive"
+  mkdir -p "$TMPDIR/documents" "$TMPDIR/documents-archive" "$TMPDIR/execution-artifacts"
   if [ -d "$PROFILES_DIR/$name/documents" ] && [ -n "$(ls -A "$PROFILES_DIR/$name/documents" 2>/dev/null || true)" ]; then
     (cd "$PROFILES_DIR/$name/documents" && tar cf - .) | (cd "$TMPDIR/documents" && tar xf -)
   fi
@@ -1542,7 +1625,12 @@ cmd_profile_archive() {
     (cd "$PROFILES_DIR/$name/documents-archive" && tar cf - .) | (cd "$TMPDIR/documents-archive" && tar xf -)
   elif ! archive_dir_is_in_profile "$name"; then
     warn "DOCUMENTS_ARCHIVE_DIR is set to an external path; archived files for '$name' are NOT included in the archive."
-    warn "Back up '$DOCUMENTS_ARCHIVE_DIR' separately if you want to preserve them."
+    warn "Back up '$(backend_configured_path DOCUMENTS_ARCHIVE_DIR)' separately if you want to preserve them."
+  fi
+  if artifact_dir_is_in_profile "$name" && [ -d "$PROFILES_DIR/$name/execution-artifacts" ] && [ -n "$(ls -A "$PROFILES_DIR/$name/execution-artifacts" 2>/dev/null || true)" ]; then
+    (cd "$PROFILES_DIR/$name/execution-artifacts" && tar cf - .) | (cd "$TMPDIR/execution-artifacts" && tar xf -)
+  elif ! artifact_dir_is_in_profile "$name"; then
+    warn "EXECUTION_ARTIFACT_STORAGE_DIR is external; execution artifacts for '$name' are NOT included in the archive."
   fi
   cp "$PROFILES_DIR/$name/metadata.json" "$TMPDIR/metadata.json" 2>/dev/null || true
 
@@ -1587,12 +1675,15 @@ cmd_profile_restore() {
 
   tar -xzf "$PROFILES_DIR/archived/${name}.tar.gz" -C "$TMPDIR"
 
-  mkdir -p "$PROFILES_DIR/$name/documents" "$PROFILES_DIR/$name/documents-archive"
+  mkdir -p "$PROFILES_DIR/$name/documents" "$PROFILES_DIR/$name/documents-archive" "$PROFILES_DIR/$name/execution-artifacts"
   if [ -d "$TMPDIR/documents" ] && [ -n "$(ls -A "$TMPDIR/documents" 2>/dev/null || true)" ]; then
     (cd "$TMPDIR/documents" && tar cf - .) | (cd "$PROFILES_DIR/$name/documents" && tar xf -)
   fi
   if [ -d "$TMPDIR/documents-archive" ] && [ -n "$(ls -A "$TMPDIR/documents-archive" 2>/dev/null || true)" ]; then
     (cd "$TMPDIR/documents-archive" && tar cf - .) | (cd "$PROFILES_DIR/$name/documents-archive" && tar xf -)
+  fi
+  if [ -d "$TMPDIR/execution-artifacts" ] && [ -n "$(ls -A "$TMPDIR/execution-artifacts" 2>/dev/null || true)" ]; then
+    (cd "$TMPDIR/execution-artifacts" && tar cf - .) | (cd "$PROFILES_DIR/$name/execution-artifacts" && tar xf -)
   fi
 
   if [ -f "$TMPDIR/metadata.json" ]; then
@@ -1656,19 +1747,19 @@ Commands:
 
   logs <service>          Tail logs for a service (backend, models, llama)
 
-  export [output_file]    Create a compressed backup of the active profile's database and documents.
+  export [output_file]    Back up the active profile's database and managed filesystem stores.
 
-  import <backup_file>    Restore database and documents into the active profile.
+  import <backup_file>    Restore database, documents, and execution artifacts into the active profile.
 
   profile:list                         List all data profiles (live + archived).
   profile:current                      Print the name of the active profile.
   profile:create <name> [--from <src>|--empty]
-                                       Create a new profile. --from <src|current> clones DB + documents
+                                       Create a new profile. --from <src|current> clones DB + filesystem stores
                                        from another profile; --empty (default) creates blank state.
   profile:clone <src> <dst>            Shortcut for 'profile:create <dst> --from <src>'.
   profile:switch <name>                Stop services and switch the active profile. Start again with 'start'.
   profile:rename <old> <new>           Rename a profile (requires services stopped if renaming the active one).
-  profile:delete <name> [--yes]        Delete a profile (documents + volumes). Cannot delete the active one.
+  profile:delete <name> [--yes]        Delete a profile (filesystem stores + volumes). Cannot delete the active one.
   profile:archive <name>               Pack a profile into .profiles/archived/<name>.tar.gz (and remove live state).
   profile:restore <name>               Unpack an archived profile back into live state.
 
@@ -1683,15 +1774,20 @@ Notes:
   serves comes from models/config/config.json (llm_defaults) and the model most
   task configs name.
 
-  Each profile has two file stores:
-    - documents/          Hot storage (active resource files).
-    - documents-archive/  Cold storage (resources archived from the app's UI).
+  Each profile has three file stores:
+    - documents/            Hot storage (active resource files).
+    - documents-archive/    Cold storage (resources archived from the app's UI).
+    - execution-artifacts/  Large immutable bodies produced by background actions.
 
-  By default, both live inside .profiles/<profile>/. Override the cold store
+  By default, all three live inside .profiles/<profile>/. Override the cold store
   with the env var DOCUMENTS_ARCHIVE_DIR to point to a slower/cheaper mount
   (HDD, NAS, S3 mount, ...). When DOCUMENTS_ARCHIVE_DIR is external, the
   profile commands above (archive, restore, export, import, reset) will
   NOT touch it — back it up separately if needed.
+
+  EXECUTION_ARTIFACT_STORAGE_DIR can likewise point to an external mount.
+  External execution artifacts are not copied, removed, or restored by profile
+  commands and must be backed up together with PostgreSQL by the operator.
 EOF
 }
 
