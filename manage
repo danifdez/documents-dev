@@ -329,6 +329,9 @@ METAEOF
 PIDFILE="$ROOT_DIR/.pids"
 LOCKFILE="$ROOT_DIR/.manage.lock"
 LOG_DIR="$ROOT_DIR/.logs"
+BACKEND_LOG="$LOG_DIR/backend.log"
+MODELS_LOG="$LOG_DIR/models.log"
+LLAMA_LOG="$LOG_DIR/llama.log"
 MAX_LOG_BACKUPS=3
 MAX_LOG_SIZE=$((10 * 1024 * 1024))  # 10MB per log file
 LOG_CHECK_INTERVAL=60                # check every 60 seconds
@@ -342,7 +345,6 @@ LOG_CHECK_INTERVAL=60                # check every 60 seconds
 # nothing answers — same binary, same settings (services/llama_server.py).
 LLAMA_DIR="$ROOT_DIR/models/bin/llama"
 LLAMA_BIN="$LLAMA_DIR/llama-server"
-LLAMA_LOG="$ROOT_DIR/.llama.log"
 
 # Where the engine answers. The worker resolves this (env, then models config,
 # then its own default), so ask it rather than duplicate the rules here.
@@ -484,7 +486,7 @@ start_log_watchdog() {
   (
     while true; do
       sleep "$LOG_CHECK_INTERVAL"
-      for logfile in "$ROOT_DIR"/.backend.log "$ROOT_DIR"/.models.log "$ROOT_DIR"/.llama.log; do
+      for logfile in "$BACKEND_LOG" "$MODELS_LOG" "$LLAMA_LOG"; do
         if [ -f "$logfile" ]; then
           size=$(stat -c%s "$logfile" 2>/dev/null || echo 0)
           if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
@@ -722,12 +724,12 @@ start_backend() {
     return 0
   fi
   ensure_log_dir
-  rotate_log "$ROOT_DIR/.backend.log"
+  rotate_log "$BACKEND_LOG"
   kill_by_pattern "nest start" "backend orphan" "$ROOT_DIR/backend" 2>/dev/null || true
   kill_by_pattern "ts-node.*nest" "backend ts-node orphan" "$ROOT_DIR/backend" 2>/dev/null || true
   info "Starting backend..."
   cd "$ROOT_DIR/backend"
-  setsid npm run start:dev > "$ROOT_DIR/.backend.log" 2>&1 &
+  setsid npm run start:dev > "$BACKEND_LOG" 2>&1 &
   BACKEND_PID=$!
   cd "$ROOT_DIR"
   ok "Backend started (PGID: $BACKEND_PID)"
@@ -741,13 +743,13 @@ start_models() {
     return 0
   fi
   ensure_log_dir
-  rotate_log "$ROOT_DIR/.models.log"
+  rotate_log "$MODELS_LOG"
   kill_by_pattern "python executions.py" "models orphan" "$ROOT_DIR/models" 2>/dev/null || true
   info "Starting models..."
   cd "$ROOT_DIR/models"
   "$ROOT_DIR/models/ensure-venv"
   source .venv/bin/activate
-  setsid python executions.py > "$ROOT_DIR/.models.log" 2>&1 &
+  setsid python executions.py > "$MODELS_LOG" 2>&1 &
   MODELS_PID=$!
   deactivate
   cd "$ROOT_DIR"
@@ -870,9 +872,9 @@ print_start_summary() {
   echo "  PostgreSQL:     localhost:5432"
   echo ""
   echo "  Logs:"
-  echo "    Backend:      tail -f .backend.log"
-  echo "    Models:       tail -f .models.log"
-  echo "    Inference:    tail -f .llama.log"
+  echo "    Backend:      tail -f .logs/backend.log"
+  echo "    Models:       tail -f .logs/models.log"
+  echo "    Inference:    tail -f .logs/llama.log"
   echo ""
   echo "  Stop:           ./manage stop"
   echo ""
@@ -1128,8 +1130,8 @@ cmd_logs() {
   local LOGFILE
 
   case "$SERVICE" in
-    backend)    LOGFILE="$ROOT_DIR/.backend.log" ;;
-    models)     LOGFILE="$ROOT_DIR/.models.log" ;;
+    backend)    LOGFILE="$BACKEND_LOG" ;;
+    models)     LOGFILE="$MODELS_LOG" ;;
     llama)      LOGFILE="$LLAMA_LOG" ;;
     *)          fail "Usage: $0 logs <backend|models|llama>" ;;
   esac
