@@ -24,6 +24,10 @@
     "age": {
       "url": "https://archive.apache.org/dist/age/PG17/1.6.0/apache-age-1.6.0-src.tar.gz",
       "sha512": "b3021cc6bb0d88a209066596a7f31fb848e4281f2ed719c105f301c7e8017969f5b472fc4b55261105b36ab3dae788e00c4bfff2febe1f147b3b13cddcead2aa"
+    },
+    "llamaCpp": {
+      "repository": "https://github.com/ggml-org/llama.cpp.git",
+      "revision": "563dec81c1c538aac0fad465ea933eb2a621a183"
     }
   },
   "builders": {

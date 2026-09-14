@@ -32,14 +32,13 @@ Options:
   --target OS-ARCH
   --output DIR
   --variant cpu|cuda|metal
-  --llama-server PATH
   --frontend-format deb|rpm|squirrel|zip
   --standalone-local          Use local release artifacts after installation
   --port PORT
 
 NODE_ARCHIVE_SHA256 can override the checksum pinned in release.config.json.
-PostgreSQL, pgvector and AGE are compiled from source archives pinned in that
-configuration. Models requires --llama-server or LLAMA_SERVER_BIN.
+PostgreSQL, pgvector, AGE and llama-server are built from pinned sources in that
+configuration.
 EOF
 }
 
@@ -49,7 +48,6 @@ VERSION="${RELEASE_VERSION:-}"
 TARGET=""
 OUTPUT=""
 VARIANT="cpu"
-LLAMA_SERVER="${LLAMA_SERVER_BIN:-}"
 FRONTEND_FORMAT="deb"
 STANDALONE_LOCAL=0
 PORT="8000"
@@ -66,7 +64,6 @@ while [ "$#" -gt 0 ]; do
     --target) TARGET="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
     --variant) VARIANT="$2"; shift 2 ;;
-    --llama-server) LLAMA_SERVER="$2"; shift 2 ;;
     --frontend-format) FRONTEND_FORMAT="$2"; shift 2 ;;
     --standalone-local) STANDALONE_LOCAL=1; shift ;;
     --port) PORT="$2"; shift 2 ;;
@@ -134,6 +131,8 @@ PGVECTOR_SOURCE_SHA256="$(node -p "require('$CONFIG').sources?.pgvector?.sha256 
 AGE_SOURCE_URL="$(node -p "require('$CONFIG').sources?.age?.url || ''")"
 AGE_SOURCE_SHA512="$(node -p "require('$CONFIG').sources?.age?.sha512 || ''")"
 POSTGRES_BUILDER_IMAGE="$(node -p "require('$CONFIG').builders?.postgresLinuxX64 || ''")"
+LLAMA_CPP_REPOSITORY="$(node -p "require('$CONFIG').sources?.llamaCpp?.repository || ''")"
+LLAMA_CPP_REVISION="$(node -p "require('$CONFIG').sources?.llamaCpp?.revision || ''")"
 
 preflight_selected_components() {
   if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "backend" ]; then
@@ -150,8 +149,8 @@ preflight_selected_components() {
     active_python="$(python3 -c 'import platform; print(platform.python_version())')"
     [ "$active_python" = "$PYTHON_VERSION" ] ||
       die "Models requires Python $PYTHON_VERSION on the build host (current: $active_python)" 3
-    [ -n "$LLAMA_SERVER" ] || die "Models requires --llama-server or LLAMA_SERVER_BIN" 3
-    [ -x "$LLAMA_SERVER" ] || die "llama-server is not executable: $LLAMA_SERVER" 3
+    [ -n "$LLAMA_CPP_REPOSITORY" ] && [ -n "$LLAMA_CPP_REVISION" ] ||
+      die "llama.cpp source is not configured" 3
   fi
   if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "postgres" ]; then
     [ -n "$POSTGRES_SOURCE_URL" ] && [ -n "$POSTGRES_SOURCE_SHA256" ] || die "PostgreSQL source is not configured" 3
@@ -193,12 +192,14 @@ package_postgres() {
 }
 
 package_models() {
-  [ -n "$LLAMA_SERVER" ] || die "Models requires --llama-server or LLAMA_SERVER_BIN" 3
-  "$ROOT_DIR/models/scripts/package-release.sh" \
+  local args=(
     --version "$VERSION" --target "$TARGET" --variant "$VARIANT" \
-    --llama-server "$LLAMA_SERVER" --pyinstaller-version "$PYINSTALLER_VERSION" \
+    --llama-cpp-repository "$LLAMA_CPP_REPOSITORY" --llama-cpp-revision "$LLAMA_CPP_REVISION" \
+    --pyinstaller-version "$PYINSTALLER_VERSION" \
     --pip-version "$PIP_VERSION" --python-version "$PYTHON_VERSION" \
     --staging "$STAGING_ROOT/models-$VARIANT" --output "$OUTPUT"
+  )
+  "$ROOT_DIR/models/scripts/package-release.sh" "${args[@]}"
 }
 
 package_frontend() {

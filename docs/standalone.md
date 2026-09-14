@@ -89,11 +89,10 @@ modifies `frontend/package.json` or its lockfile:
 
 ```bash
 # Build the complete standalone target
-./build-release all --version 1.0.0 --llama-server /path/to/llama-server
+./build-release all --version 1.0.0
 
 # Build an installer that uses this local release directory at runtime
-./build-release all --version 1.0.0 --standalone-local \
-  --llama-server /path/to/llama-server
+./build-release all --version 1.0.0 --standalone-local
 
 # Build only the lightweight installer (~150 MB)
 ./build-release frontend --version 1.0.0
@@ -105,12 +104,10 @@ modifies `frontend/package.json` or its lockfile:
 ./build-release node --version 1.0.0
 
 # Build the models service (CPU variant, ~2 GB)
-./build-release models --version 1.0.0 --variant cpu \
-  --llama-server /path/to/llama-server
+./build-release models --version 1.0.0 --variant cpu
 
 # Build the models service (GPU/CUDA variant, ~5 GB)
-./build-release models --version 1.0.0 --variant cuda \
-  --llama-server /path/to/llama-server
+./build-release models --version 1.0.0 --variant cuda
 ```
 
 The Node source checksum is pinned per target in `release.config.json`;
@@ -118,6 +115,7 @@ The Node source checksum is pinned per target in `release.config.json`;
 The PostgreSQL build compiles PostgreSQL, pgvector and Apache AGE from the
 pinned source archives declared in `release.config.json`. If the host lacks
 the native toolchain, it uses the pinned Debian builder image through Docker.
+Models compiles its pinned `llama.cpp` revision automatically.
 
 `--standalone-local` keeps the installer lightweight and configures it to copy
 the generated Node, Backend, PostgreSQL and Models archives from its local
