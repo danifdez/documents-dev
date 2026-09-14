@@ -1,460 +1,229 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT_DIR"
+# shellcheck disable=SC1091
+source "$ROOT_DIR/scripts/release/common.sh"
 
-# ── Colors ──
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-BOLD='\033[1m'
-DIM='\033[2m'
-
-info()  { printf "${CYAN}[INFO]${NC}  %s\n" "$*"; }
-ok()    { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
-warn()  { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
-fail()  { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; exit 1; }
-step()  { printf "\n${BOLD}${CYAN}── %s ──${NC}\n" "$*"; }
-
-APP_VERSION="1.0.0"
-RELEASE_DIR="$ROOT_DIR/release-assets"
-# Embedded PostgreSQL version (zonky binaries) we repackage with pgvector.
-POSTGRES_VERSION="17.6.0"
-PYINSTALLER_VERSION="6.21.0"
-
-# ── Detect platform and architecture ──
-detect_platform() {
-  local os arch
-  case "$(uname -s)" in
-    Linux*)  os="linux" ;;
-    Darwin*) os="darwin" ;;
-    MINGW*|MSYS*|CYGWIN*) os="win32" ;;
-    *) fail "Unsupported OS: $(uname -s)" ;;
-  esac
-  case "$(uname -m)" in
-    x86_64|amd64) arch="x64" ;;
-    aarch64|arm64) arch="arm64" ;;
-    *) fail "Unsupported architecture: $(uname -m)" ;;
-  esac
-  echo "${os}-${arch}"
-}
-
-PLATFORM="$(detect_platform)"
-info "Detected platform: $PLATFORM"
-
-# Determine Electron version used by the frontend so we can rebuild native
-# modules for the Electron runtime when packaging the backend. Falls back to
-# empty string if not found.
-ELECTRON_VERSION="$(node -e 'try{const p=require("./frontend/package.json"); console.log(p.dependencies?.electron||p.devDependencies?.electron||p.electron||"")}catch(e){console.log("")}' 2>/dev/null || true)"
-
-archive_ext() {
-  [ "$PLATFORM" = "win32-x64" ] && echo "zip" || echo "tar.gz"
-}
-
-# ════════════════════════════════════════════════════════════════════
-# BUILD BACKEND RELEASE ASSET
-# ════════════════════════════════════════════════════════════════════
-build_backend() {
-  step "Building backend release asset"
-
-  cd "$ROOT_DIR/backend"
-
-  info "Installing backend dependencies..."
-  npm ci --quiet 2>&1 | tail -3
-  ok "Dependencies installed"
-
-  info "Compiling TypeScript..."
-  npm run build --quiet
-  ok "Backend compiled"
-
-  local staging="$ROOT_DIR/.build-staging/backend"
-  rm -rf "$staging"
-  mkdir -p "$staging"
-
-  cp -r dist "$staging/dist"
-  # Seed files (e.g. resource-type.csv) are read at runtime by migrations but
-  # aren't compiled into dist. Ship them at dist/data so the migration's
-  # __dirname/../data lookup resolves regardless of the process cwd.
-  [ -d data ] && cp -r data "$staging/dist/data"
-  cp package.json "$staging/package.json"
-  cp package-lock.json "$staging/package-lock.json" 2>/dev/null || true
-
-  info "Installing production dependencies..."
-  cd "$staging"
-  npm ci --omit=dev --quiet 2>&1 | tail -3
-
-  # If we know the frontend Electron version, try to rebuild native modules
-  # against Electron's ABI so the packaged backend works when forked from the
-  # Electron process at runtime.
-  if [ -n "$ELECTRON_VERSION" ]; then
-    info "Electron version detected: $ELECTRON_VERSION — rebuilding native modules for Electron"
-    # install electron-rebuild temporarily
-    npm i --no-audit --no-fund electron-rebuild@latest --silent 2>/dev/null || true
-    npx electron-rebuild -v "$ELECTRON_VERSION" --module-dir . || warn "electron-rebuild failed; native modules may be incompatible"
-  else
-    warn "Electron version not detected — skipping electron-rebuild"
-  fi
-
-  mkdir -p "$RELEASE_DIR"
-  local name="documents-backend-v${APP_VERSION}-${PLATFORM}"
-  # Archive the contents of backend/ (not the dir itself) so the app extracts
-  # straight into standalone-services/backend/ without a doubled prefix.
-  cd "$ROOT_DIR/.build-staging/backend"
-  if [ "$(archive_ext)" = "zip" ]; then
-    zip -qr "$RELEASE_DIR/${name}.zip" .
-  else
-    tar czf "$RELEASE_DIR/${name}.tar.gz" .
-  fi
-
-  rm -rf "$ROOT_DIR/.build-staging/backend"
-  ok "Backend asset: $RELEASE_DIR/${name}.$(archive_ext) ($(du -sh "$RELEASE_DIR/${name}."* | cut -f1))"
-  cd "$ROOT_DIR"
-}
-
-# ════════════════════════════════════════════════════════════════════
-# BUILD POSTGRESQL + PGVECTOR ASSET
-# ════════════════════════════════════════════════════════════════════
-# Repackages the zonky embedded PostgreSQL binaries with the pgvector extension
-# baked in, so the standalone app installs a vector-capable server out of the
-# box (the embedded server ships no compiler). The prebuilt pgvector files come
-# from the official PostgreSQL APT repository (.deb) — no docker, no compiler.
-build_postgres() {
-  step "Building PostgreSQL + pgvector asset"
-
-  local jarPlatform debArch
-  case "$PLATFORM" in
-    linux-x64)   jarPlatform="linux-amd64";   debArch="amd64" ;;
-    linux-arm64) jarPlatform="linux-arm64v8"; debArch="arm64" ;;
-    *) fail "postgres build currently supports linux only (got $PLATFORM)." ;;
-  esac
-  command -v unzip    >/dev/null 2>&1 || fail "unzip is required to unpack the zonky jar."
-  command -v dpkg-deb >/dev/null 2>&1 || fail "dpkg-deb is required to unpack the pgvector .deb (Debian/Ubuntu)."
-
-  local staging="$ROOT_DIR/.build-staging/postgres"
-  rm -rf "$staging"; mkdir -p "$staging"
-
-  # 1. Download + unpack the zonky embedded PostgreSQL binaries (jar → .txz → tree).
-  local jar="$ROOT_DIR/.build-staging/pg.jar"
-  local url="https://repo1.maven.org/maven2/io/zonky/test/postgres/embedded-postgres-binaries-${jarPlatform}/${POSTGRES_VERSION}/embedded-postgres-binaries-${jarPlatform}-${POSTGRES_VERSION}.jar"
-  info "Downloading zonky PostgreSQL ${POSTGRES_VERSION} ($jarPlatform)..."
-  curl -fSL "$url" -o "$jar"
-  ( cd "$staging" && unzip -qo "$jar" )
-  rm -f "$jar"
-  local txz
-  txz="$(find "$staging" -maxdepth 1 -name '*.txz' | head -1)"
-  [ -n "$txz" ] || fail "zonky jar did not contain a .txz payload"
-  tar xf "$txz" -C "$staging"
-  rm -f "$txz"
-  rm -rf "$staging/META-INF"
-
-  # 2. Fetch the prebuilt pgvector for PostgreSQL 17 from the PGDG APT pool. The
-  # pgdg12 (Debian 12) build is glibc-portable and matches the zonky pg17 ABI.
-  local pool="https://apt.postgresql.org/pub/repos/apt/pool/main/p/pgvector/"
-  local deb
-  deb="$(curl -fsSL "$pool" | grep -oE "postgresql-17-pgvector_[0-9.]+-[0-9]+\.pgdg12\+1_${debArch}\.deb" | sort -V | tail -1)"
-  [ -n "$deb" ] || fail "no postgresql-17-pgvector .deb found for $debArch in the PGDG pool"
-  info "Fetching pgvector: $deb"
-  local pgtmp="$ROOT_DIR/.build-staging/pgvector-files"
-  rm -rf "$pgtmp"; mkdir -p "$pgtmp"
-  curl -fsSL "${pool}${deb}" -o "$pgtmp/pgvector.deb"
-  dpkg-deb -x "$pgtmp/pgvector.deb" "$pgtmp/x"
-
-  # 3. Drop pgvector into the extracted server (detect the real lib/extension dirs).
-  local pkglib extdir
-  pkglib="$(dirname "$(find "$staging" -name 'plpgsql.so' | head -1)")"
-  extdir="$(dirname "$(find "$staging" -name 'plpgsql.control' | head -1)")"
-  [ -n "$pkglib" ] && [ -n "$extdir" ] || fail "could not locate the server's lib/extension dirs"
-  cp "$pgtmp/x/usr/lib/postgresql/17/lib/vector.so" "$pkglib/"
-  cp "$pgtmp/x/usr/share/postgresql/17/extension/vector.control" "$extdir/"
-  cp "$pgtmp/x/usr/share/postgresql/17/extension"/vector--*.sql "$extdir/"
-  rm -rf "$pgtmp"
-
-  # 3b. Drop Apache AGE (entity graph + GraphRAG) into the same server. Unlike
-  # pgvector, AGE ships no .deb in the PGDG pool, so its artifacts must be built
-  # from source against PG17 (see docker/database/Dockerfile, which compiles the
-  # pinned AGE tag) and the resulting age.so / age.control / age--*.sql placed in
-  # a directory pointed to by AGE_ARTIFACTS_DIR (layout: lib/age.so plus
-  # extension/age.control + extension/age--*.sql). When that's not provided we
-  # still ship a working vector-only server, but WARN loudly: the relationships
-  # feature (and GraphRAG) won't work in standalone until AGE is bundled.
-  local agedir="${AGE_ARTIFACTS_DIR:-}"
-  if [ -n "$agedir" ] && [ -f "$agedir/lib/age.so" ]; then
-    cp "$agedir/lib/age.so" "$pkglib/"
-    cp "$agedir/extension/age.control" "$extdir/"
-    cp "$agedir/extension"/age--*.sql "$extdir/"
-    ok "Apache AGE bundled into the embedded PostgreSQL"
-  else
-    warn "Apache AGE artifacts not found (set AGE_ARTIFACTS_DIR to a dir with lib/age.so + extension/age.*)."
-    warn "Shipping a vector-only server: the relationships feature / GraphRAG will be unavailable in standalone."
-  fi
-
-  # 4. Package (bin/lib/share at the archive root, like the app expects).
-  mkdir -p "$RELEASE_DIR"
-  local name="documents-postgres-v${APP_VERSION}-${PLATFORM}"
-  ( cd "$staging" && tar czf "$RELEASE_DIR/${name}.tar.gz" . )
-  rm -rf "$staging"
-  ok "PostgreSQL+pgvector asset: $RELEASE_DIR/${name}.tar.gz ($(du -sh "$RELEASE_DIR/${name}.tar.gz" | cut -f1))"
-}
-
-# ════════════════════════════════════════════════════════════════════
-# BUILD ELECTRON INSTALLER (frontend only, lightweight)
-# ════════════════════════════════════════════════════════════════════
-build_installer() {
-  step "Building Electron installer (frontend only)"
-
-  cd "$ROOT_DIR/frontend"
-
-  info "Installing frontend dependencies..."
-  npm ci --quiet 2>&1 | tail -3
-  ok "Dependencies installed"
-
-  info "Building Electron app..."
-  npm run make 2>&1 | tail -20
-
-  echo ""
-  ok "Installer build complete!"
-
-  if [ -d "out/make" ]; then
-    info "Installers:"
-    find out/make -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.exe" -o -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" \) | while read -r f; do
-      printf "  ${GREEN}→${NC} %s ${DIM}(%s)${NC}\n" "$f" "$(du -sh "$f" | cut -f1)"
-    done
-  fi
-
-  cd "$ROOT_DIR"
-}
-
-# ════════════════════════════════════════════════════════════════════
-# BUILD MODELS SERVICE (PyInstaller)
-# ════════════════════════════════════════════════════════════════════
-build_models() {
-  local variant="${1:-cpu}"
-  step "Building models service (${variant})"
-
-  cd "$ROOT_DIR/models"
-
-  [ -f "executions.py" ] || fail "models/executions.py not found"
-  [ -f "documents-models.spec" ] || fail "models/documents-models.spec not found"
-
-  # Each variant builds in its OWN venv with its OWN deps. CPU and CUDA builds of
-  # torch can't coexist in one environment, so the variant must decide what gets
-  # installed — not just the asset name. The LLM runtime is no longer among them:
-  # it is the llama-server binary copied into the bundle further down.
-  local venv="$ROOT_DIR/.build-staging/venv-models-${variant}"
-  info "Creating isolated build venv (${variant})..."
-  rm -rf "$venv"
-  python3 -m venv "$venv"
-  if [ -f "$venv/bin/activate" ]; then
-    # shellcheck disable=SC1091
-    source "$venv/bin/activate"
-  else
-    # shellcheck disable=SC1091
-    source "$venv/Scripts/activate"  # Windows (MSYS/Git-Bash)
-  fi
-
-  info "Installing ${variant} dependencies (downloads several GB)..."
-  pip install --quiet --upgrade pip
-  if [ "$variant" = "gpu" ]; then
-    # GPU wheels first (CUDA torch + cupy via their extra-index-url), then the
-    # rest; requirements.txt sees torch already satisfied and won't pull the CPU
-    # build over it.
-    pip install --quiet -r requirements-gpu.txt
-  fi
-  pip install --quiet -r requirements.txt
-  pip install --quiet "pyinstaller==${PYINSTALLER_VERSION}"
-
-  # Install the spaCy model as a real wheel BEFORE bundling so PyInstaller can
-  # collect both its code AND its dist-info metadata. spacy.load("en_core_web_sm")
-  # resolves the model via importlib.metadata (is_package), so without the
-  # metadata the frozen worker fails to load it and falls back to a network
-  # `pip/uv install` — which has no pip in the bundle and no venv for uv, aborting
-  # `--setup` with a SystemExit. Bundling the metadata makes load-by-name work.
-  info "Installing spaCy model into build venv..."
-  python -m spacy download en_core_web_sm --quiet 2>/dev/null || true
-
-  info "Bundling Python + dependencies (this takes a while)..."
-
-  pyinstaller --noconfirm documents-models.spec
-
-  ok "Models service built (spaCy model + metadata bundled in-place)"
-
-  # The inference engine travels with the asset. There is no `manage` in an
-  # installed app to start it, so the worker looks for llama-server next to its
-  # own executable (see services/llama_server.py) and starts it when nothing else
-  # has. Whether the copied binary has CUDA is whatever `manage llama install`
-  # put in bin/llama — the variant name here does not change it.
-  if [ -x "$ROOT_DIR/bin/llama/llama-server" ]; then
-    info "Bundling inference engine (llama-server)..."
-    mkdir -p "dist/documents-models/llama"
-    cp -a "$ROOT_DIR/bin/llama/." "dist/documents-models/llama/"
-    ok "Engine bundled ($(du -sh dist/documents-models/llama | cut -f1))"
-  else
-    warn "No engine at bin/llama/llama-server — the asset ships without one."
-    warn "Run 'bash manage llama install' before building, or the installed app"
-    warn "will have no LLM until LLAMA_SERVER_BIN/URL points it at one."
-  fi
-
-  mkdir -p "$RELEASE_DIR"
-  local name="documents-models-v${APP_VERSION}-${PLATFORM}-${variant}"
-  # Archive the CONTENTS of the onedir bundle (not the dir itself) so the app
-  # extracts the binary straight into models-service/ without a doubled prefix
-  # (otherwise models-service/documents-models is a dir and spawn() gets EACCES).
-  if [ "$(archive_ext)" = "zip" ]; then
-    ( cd dist/documents-models && zip -qr "$RELEASE_DIR/${name}.zip" . )
-  else
-    tar czf "$RELEASE_DIR/${name}.tar.gz" -C dist/documents-models .
-  fi
-  ok "Models asset: $RELEASE_DIR/${name}.$(archive_ext) ($(du -sh "$RELEASE_DIR/${name}."* | cut -f1))"
-
-  deactivate || true
-  cd "$ROOT_DIR"
-}
-
-# ════════════════════════════════════════════════════════════════════
-# CLEAN
-# ════════════════════════════════════════════════════════════════════
-clean() {
-  step "Cleaning build artifacts"
-  rm -rf "$ROOT_DIR/.build-staging"
-  rm -rf "$ROOT_DIR/release-assets"
-  rm -rf "$ROOT_DIR/frontend/out"
-  rm -rf "$ROOT_DIR/backend/dist"
-  rm -rf "$ROOT_DIR/models/dist"
-  rm -rf "$ROOT_DIR/models/build"
-  ok "Clean"
-}
-
-# ════════════════════════════════════════════════════════════════════
-# SERVE LOCALLY (stand in for GitHub Releases)
-# ════════════════════════════════════════════════════════════════════
-serve_local() {
-  local port="${1:-8000}"
-  step "Serving release-assets as a local release server"
-
-  [ -d "$RELEASE_DIR" ] || fail "No release-assets/. Build first (e.g. ./build-release backend && ./build-release models-cpu)."
-
-  # The app requests \$BASE/v1.0.0/<asset>; expose the assets under that tag dir
-  # via symlinks so the existing flat release-assets/ keeps working too.
-  local tag="v${APP_VERSION}"
-  local tagdir="$RELEASE_DIR/$tag"
-  mkdir -p "$tagdir"
-  shopt -s nullglob
-  for f in "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR"/*.zip; do
-    ln -sf "../$(basename "$f")" "$tagdir/$(basename "$f")"
-  done
-  shopt -u nullglob
-
-  info "Assets available under $tag/:"
-  ls -1 "$tagdir" 2>/dev/null | sed 's/^/  /' || warn "  (none — build the assets first)"
-  echo ""
-  ok "Launch the app pointing at this server:"
-  printf "  ${BOLD}DOCUMENTS_RELEASE_BASE_URL=http://localhost:%s npm start${NC}  ${DIM}(run in frontend/)${NC}\n\n" "$port"
-  info "Serving on http://localhost:$port — Ctrl-C to stop"
-  cd "$RELEASE_DIR"
-  python3 -m http.server "$port"
-}
-
-# ════════════════════════════════════════════════════════════════════
-# HELP
-# ════════════════════════════════════════════════════════════════════
 show_help() {
-  cat <<EOF
+  cat <<'EOF'
+Documents release builder
 
-${BOLD}Documents Build${NC}
+Usage:
+  ./build-release <command> --version <semver> [options]
 
-Builds the Electron installer and the release assets for standalone mode.
-PostgreSQL is repackaged here with pgvector and Apache AGE baked in, so the
-embedded server provides both semantic search and the entity graph (GraphRAG)
-with no separate service. AGE artifacts come from AGE_ARTIFACTS_DIR (built from
-source — see docker/database/Dockerfile); without it the asset is vector-only.
+Commands:
+  all             Build the complete standalone target
+  node            Build the bundled Node.js runtime
+  backend         Build Backend
+  postgres        Build embedded PostgreSQL
+  models          Build Models (default variant: cpu)
+  models-cpu      Alias for models --variant cpu
+  models-gpu      Alias for models --variant cuda
+  frontend        Build the Electron installer
+  installer       Alias for frontend
+  verify          Verify an existing release directory
+  serve           Serve an existing release directory locally
+  clean           Remove release staging/output
+  help
 
-${BOLD}Usage:${NC}
-  ./build-release [command]
+Options:
+  --version VERSION
+  --target OS-ARCH
+  --output DIR
+  --variant cpu|cuda|metal
+  --llama-server PATH
+  --frontend-format deb|rpm|squirrel|zip
+  --port PORT
 
-${BOLD}Commands:${NC}
-  ${GREEN}all${NC}             Build backend asset + Electron installer
-  ${GREEN}installer${NC}       Build only the Electron app installer (~150 MB)
-  ${GREEN}backend${NC}         Build the backend release asset (~50 MB)
-  ${GREEN}postgres${NC}        Build the PostgreSQL + pgvector (+ AGE if AGE_ARTIFACTS_DIR) asset (~200 MB; needs dpkg-deb)
-  ${GREEN}models-cpu${NC}      Build the models service for CPU (~2 GB)
-  ${GREEN}models-gpu${NC}      Build the models service for GPU/CUDA (~5 GB)
-  ${GREEN}models-all${NC}      Build both CPU and GPU variants
-  ${GREEN}serve [port]${NC}    Serve release-assets/ locally as a stand-in for GitHub
-                  Releases (default port 8000)
-  ${GREEN}clean${NC}           Remove all build artifacts
-  ${GREEN}help${NC}            Show this help
-
-${BOLD}Test standalone locally (without GitHub):${NC}
-  1. ./build-release backend           # ~50 MB, quick
-  2. ./build-release postgres           # ~200 MB; needs dpkg-deb (Debian/Ubuntu)
-  3. ./build-release models-cpu         # ~2 GB, slow (downloads deps)
-  4. ./build-release serve              # serves release-assets/ on :8000
-  5. cd frontend && DOCUMENTS_RELEASE_BASE_URL=http://localhost:8000 npm start
-
-${BOLD}Covering "any machine":${NC}
-  Each models variant builds in its own venv with its own deps (CPU vs CUDA).
-  The wizard detects the user's GPU at runtime and downloads the right one.
-  ${YELLOW}Limits:${NC} PyInstaller does NOT cross-compile — run this script once per OS
-  (Linux/Windows/macOS) to cover them. The GPU variant needs the CUDA wheels
-  reachable (build host needs internet; a physical GPU is not required to build).
-
-${BOLD}Workflow:${NC}
-  1. ./build-release backend       # Build backend asset
-  2. Upload release-assets/ to GitHub Releases
-  3. ./build-release installer     # Build the lightweight installer
-  4. Distribute the installer
-
-${BOLD}What we host on GitHub Releases:${NC}
-  Backend        ~50 MB    compiled NestJS + node_modules
-  PostgreSQL     ~200 MB   zonky binaries repackaged with pgvector
-  Models (CPU)   ~2 GB     PyInstaller bundle (optional)
-  Models (GPU)   ~5 GB     PyInstaller bundle with CUDA (optional)
-
-${BOLD}Output:${NC}
-  frontend/out/make/        Platform installer
-  release-assets/           Assets for GitHub Releases
-
-${BOLD}Platform:${NC} $PLATFORM
-
+NODE_ARCHIVE_SHA256 can override the checksum pinned in release.config.json.
+PostgreSQL, pgvector and AGE are compiled from source archives pinned in that
+configuration. Models requires --llama-server or LLAMA_SERVER_BIN.
 EOF
 }
 
-# ════════════════════════════════════════════════════════════════════
-# MAIN
-# ════════════════════════════════════════════════════════════════════
 COMMAND="${1:-help}"
-shift || true
+[ "$#" -eq 0 ] || shift
+VERSION="${RELEASE_VERSION:-}"
+TARGET=""
+OUTPUT=""
+VARIANT="cpu"
+LLAMA_SERVER="${LLAMA_SERVER_BIN:-}"
+FRONTEND_FORMAT="deb"
+PORT="8000"
 
 case "$COMMAND" in
-  all)
-    echo ""
-    printf "${BOLD}${CYAN}════════════════════════════════════════${NC}\n"
-    printf "${BOLD}${CYAN}  Documents Build — ${PLATFORM}${NC}\n"
-    printf "${BOLD}${CYAN}════════════════════════════════════════${NC}\n"
-    build_backend
-    build_installer
-    echo ""
-    printf "${BOLD}${GREEN}Build complete!${NC}\n"
-    info "Release assets: release-assets/"
-    info "Installer:      frontend/out/make/"
-    ;;
-  installer)    build_installer ;;
-  backend)      build_backend ;;
-  postgres)     build_postgres ;;
-  models-cpu)   build_models cpu ;;
-  models-gpu)   build_models gpu ;;
-  models-all)   build_models cpu; build_models gpu ;;
-  serve)        serve_local "${1:-8000}" ;;
-  clean)
-    clean
-    if [ "${1:-}" = "all" ]; then
-      shift || true
-      exec "$0" all "$@"
-    fi
-    ;;
-  help|--help|-h) show_help ;;
-  *) fail "Unknown command: $COMMAND. Run '$0 help' for usage." ;;
+  models-cpu) COMMAND="models"; VARIANT="cpu" ;;
+  models-gpu) COMMAND="models"; VARIANT="cuda" ;;
+  installer) COMMAND="frontend" ;;
 esac
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version) VERSION="$2"; shift 2 ;;
+    --target) TARGET="$2"; shift 2 ;;
+    --output) OUTPUT="$2"; shift 2 ;;
+    --variant) VARIANT="$2"; shift 2 ;;
+    --llama-server) LLAMA_SERVER="$2"; shift 2 ;;
+    --frontend-format) FRONTEND_FORMAT="$2"; shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
+    *) die "Unknown release argument: $1" 2 ;;
+  esac
+done
+
+if [ "$COMMAND" = "help" ] || [ "$COMMAND" = "--help" ] || [ "$COMMAND" = "-h" ]; then
+  show_help
+  exit 0
+fi
+
+STAGING_ROOT="$ROOT_DIR/.build-staging/release"
+if [ "$COMMAND" = "clean" ]; then
+  assert_inside_workspace "$STAGING_ROOT"
+  assert_inside_workspace "$ROOT_DIR/release-output"
+  rm -rf "$STAGING_ROOT" "$ROOT_DIR/release-output"
+  log_info "Release staging and output removed"
+  exit 0
+fi
+
+[ -n "$VERSION" ] || die "--version is required" 2
+validate_semver "$VERSION"
+TARGET="${TARGET:-$(detect_target)}"
+OUTPUT="${OUTPUT:-$ROOT_DIR/release-output/$VERSION}"
+assert_inside_workspace "$OUTPUT"
+mkdir -p "$OUTPUT" "$OUTPUT/.metadata/$TARGET" "$OUTPUT/logs" "$STAGING_ROOT"
+
+if [ "$COMMAND" = "verify" ]; then
+  DOCUMENTS_REQUIRE_STANDALONE="${DOCUMENTS_REQUIRE_STANDALONE:-0}" \
+    node "$ROOT_DIR/scripts/release/verify-release.mjs" "$OUTPUT"
+  exit 0
+fi
+
+if [ "$COMMAND" = "serve" ]; then
+  [ -f "$OUTPUT/release.json" ] || die "Release manifest not found: $OUTPUT/release.json" 3
+  log_info "Serving $OUTPUT on http://127.0.0.1:$PORT"
+  cd "$OUTPUT"
+  exec python3 -m http.server "$PORT" --bind 127.0.0.1
+fi
+
+CONFIG="$ROOT_DIR/release.config.json"
+require_file "$CONFIG"
+require_command node
+node - "$CONFIG" "$TARGET" <<'NODE'
+const [, , configPath, target] = process.argv;
+const config = require(configPath);
+if (!config.targets?.[target]) {
+  console.error(`Target is not configured: ${target}`);
+  process.exit(2);
+}
+NODE
+NODE_VERSION="$(node -p "require('$CONFIG').runtimes.node")"
+POSTGRES_VERSION="$(node -p "require('$CONFIG').runtimes.postgres")"
+PYINSTALLER_VERSION="$(node -p "require('$CONFIG').runtimes.pyinstaller")"
+PIP_VERSION="$(node -p "require('$CONFIG').runtimes.pip")"
+PYTHON_VERSION="$(node -p "require('$CONFIG').runtimes.python")"
+NODE_ARCHIVE_SHA256_VALUE="${NODE_ARCHIVE_SHA256:-$(node -p "require('$CONFIG').sources?.node?.sha256?.['$TARGET'] || ''")}"
+POSTGRES_SOURCE_URL="$(node -p "require('$CONFIG').sources?.postgres?.url || ''")"
+POSTGRES_SOURCE_SHA256="$(node -p "require('$CONFIG').sources?.postgres?.sha256 || ''")"
+PGVECTOR_SOURCE_URL="$(node -p "require('$CONFIG').sources?.pgvector?.url || ''")"
+PGVECTOR_SOURCE_SHA256="$(node -p "require('$CONFIG').sources?.pgvector?.sha256 || ''")"
+AGE_SOURCE_URL="$(node -p "require('$CONFIG').sources?.age?.url || ''")"
+AGE_SOURCE_SHA512="$(node -p "require('$CONFIG').sources?.age?.sha512 || ''")"
+POSTGRES_BUILDER_IMAGE="$(node -p "require('$CONFIG').builders?.postgresLinuxX64 || ''")"
+
+preflight_selected_components() {
+  if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "backend" ]; then
+    local active_node
+    active_node="$(node -p 'process.versions.node')"
+    [ "$active_node" = "$NODE_VERSION" ] ||
+      die "Backend requires Node $NODE_VERSION on the build host (current: $active_node)" 3
+  fi
+  if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "node" ]; then
+    [ -n "$NODE_ARCHIVE_SHA256_VALUE" ] || die "Node archive checksum is not configured for $TARGET" 3
+  fi
+  if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "models" ]; then
+    local active_python
+    active_python="$(python3 -c 'import platform; print(platform.python_version())')"
+    [ "$active_python" = "$PYTHON_VERSION" ] ||
+      die "Models requires Python $PYTHON_VERSION on the build host (current: $active_python)" 3
+    [ -n "$LLAMA_SERVER" ] || die "Models requires --llama-server or LLAMA_SERVER_BIN" 3
+    [ -x "$LLAMA_SERVER" ] || die "llama-server is not executable: $LLAMA_SERVER" 3
+  fi
+  if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "postgres" ]; then
+    [ -n "$POSTGRES_SOURCE_URL" ] && [ -n "$POSTGRES_SOURCE_SHA256" ] || die "PostgreSQL source is not configured" 3
+    [ -n "$PGVECTOR_SOURCE_URL" ] && [ -n "$PGVECTOR_SOURCE_SHA256" ] || die "pgvector source is not configured" 3
+    [ -n "$AGE_SOURCE_URL" ] && [ -n "$AGE_SOURCE_SHA512" ] || die "Apache AGE source is not configured" 3
+    [ -n "$POSTGRES_BUILDER_IMAGE" ] || die "PostgreSQL builder image is not configured" 3
+  fi
+}
+
+preflight_selected_components
+
+package_backend() {
+  "$ROOT_DIR/backend/scripts/package-release.sh" \
+    --version "$VERSION" --target "$TARGET" --node-version "$NODE_VERSION" \
+    --staging "$STAGING_ROOT/backend" --output "$OUTPUT"
+}
+
+package_node() {
+  "$ROOT_DIR/scripts/release/package-node.sh" \
+    --version "$VERSION" --node-version "$NODE_VERSION" --target "$TARGET" \
+    --archive-sha256 "$NODE_ARCHIVE_SHA256_VALUE" \
+    --staging "$STAGING_ROOT/node" --output "$OUTPUT"
+}
+
+package_postgres() {
+  local args=(
+    --version "$VERSION" --postgres-version "$POSTGRES_VERSION" --target "$TARGET" \
+    --postgres-source-url "$POSTGRES_SOURCE_URL" --postgres-source-sha256 "$POSTGRES_SOURCE_SHA256" \
+    --pgvector-source-url "$PGVECTOR_SOURCE_URL" --pgvector-source-sha256 "$PGVECTOR_SOURCE_SHA256" \
+    --age-source-url "$AGE_SOURCE_URL" --age-source-sha512 "$AGE_SOURCE_SHA512" \
+    --staging "$STAGING_ROOT/postgres" --output "$OUTPUT"
+  )
+  if command -v flex >/dev/null 2>&1 && command -v bison >/dev/null 2>&1; then
+    "$ROOT_DIR/scripts/release/package-postgres.sh" "${args[@]}"
+  else
+    "$ROOT_DIR/scripts/release/build-postgres-container.sh" \
+      --image "$POSTGRES_BUILDER_IMAGE" -- "${args[@]}"
+  fi
+}
+
+package_models() {
+  [ -n "$LLAMA_SERVER" ] || die "Models requires --llama-server or LLAMA_SERVER_BIN" 3
+  "$ROOT_DIR/models/scripts/package-release.sh" \
+    --version "$VERSION" --target "$TARGET" --variant "$VARIANT" \
+    --llama-server "$LLAMA_SERVER" --pyinstaller-version "$PYINSTALLER_VERSION" \
+    --pip-version "$PIP_VERSION" --python-version "$PYTHON_VERSION" \
+    --staging "$STAGING_ROOT/models-$VARIANT" --output "$OUTPUT"
+}
+
+package_frontend() {
+  "$ROOT_DIR/frontend/scripts/package-release.sh" \
+    --version "$VERSION" --target "$TARGET" --format "$FRONTEND_FORMAT" \
+    --staging "$STAGING_ROOT/frontend" --output "$OUTPUT"
+}
+
+case "$COMMAND" in
+  node) package_node ;;
+  backend) package_backend ;;
+  postgres) package_postgres ;;
+  models) package_models ;;
+  frontend) package_frontend ;;
+  all)
+    package_node
+    package_backend
+    package_postgres
+    package_models
+    package_frontend
+    ;;
+  *) die "Unknown release command: $COMMAND" 2 ;;
+esac
+
+node "$ROOT_DIR/scripts/release/manifest.mjs" \
+  --version "$VERSION" --target "$TARGET" --output "$OUTPUT" --metadata "$OUTPUT/.metadata/$TARGET"
+if [ "$COMMAND" = "all" ]; then
+  DOCUMENTS_REQUIRE_STANDALONE=1 node "$ROOT_DIR/scripts/release/verify-release.mjs" "$OUTPUT"
+else
+  node "$ROOT_DIR/scripts/release/verify-release.mjs" "$OUTPUT"
+fi
+
+log_info "Release output: $OUTPUT"

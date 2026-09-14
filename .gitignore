@@ -13,3 +13,4 @@ models/venv/
 .claude/**
 .build-staging/**
 release-assets/
+release-output/

@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "runtimes": {
+    "node": "22.23.1",
+    "python": "3.12.3",
+    "postgres": "17.6.0",
+    "pyinstaller": "6.21.0",
+    "pip": "25.3"
+  },
+  "sources": {
+    "node": {
+      "sha256": {
+        "linux-x64": "7a8cb04b4a1df4eaf432125324b81b29a088e73570a23259a8de1c65d07fc129"
+      }
+    },
+    "postgres": {
+      "url": "https://ftp.postgresql.org/pub/source/v17.6/postgresql-17.6.tar.gz",
+      "sha256": "2910b85283674da2dae6ac13fe5ebbaaf3c482446396cba32e6728d3cc736d86"
+    },
+    "pgvector": {
+      "url": "https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.6.tar.gz",
+      "sha256": "10bf9938906e5d643bbc4a7eea104b6f57ba4898e5b76b20e60484ea1d5a7f8f"
+    },
+    "age": {
+      "url": "https://archive.apache.org/dist/age/PG17/1.6.0/apache-age-1.6.0-src.tar.gz",
+      "sha512": "b3021cc6bb0d88a209066596a7f31fb848e4281f2ed719c105f301c7e8017969f5b472fc4b55261105b36ab3dae788e00c4bfff2febe1f147b3b13cddcead2aa"
+    }
+  },
+  "builders": {
+    "postgresLinuxX64": "debian@sha256:67b30a61dc87758f0caf819646104f29ecbda97d920aaf5edc834128ac8493d3"
+  },
+  "targets": {
+    "linux-x64": {
+      "node": true,
+      "backend": true,
+      "postgres": true,
+      "models": ["cpu"],
+      "frontend": ["deb"]
+    }
+  }
+}

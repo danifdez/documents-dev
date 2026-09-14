@@ -8,7 +8,9 @@ requiring an external server or Docker. The Electron installer is lightweight
 local workspace.
 
 The installer and the release assets needed for standalone mode are produced by
-the `build-standalone` script at the root of the repository.
+the `build-release` script at the root of the repository. Every build receives
+an explicit product version and produces a `release.json` manifest plus SHA-256
+checksums.
 
 ## How It Works
 
@@ -24,22 +26,24 @@ required services in the background.
 
 ## Services Downloaded at First Launch
 
-The following components are downloaded from their official sources when the user
-selects standalone mode for the first time. No additional action is required.
+The following components are downloaded from the Documents release selected by
+`release.json` when the user selects standalone mode for the first time. Every
+archive is checked against the size and SHA-256 recorded in that manifest.
 
 | Service | Approximate size | Source |
 |---------|-----------------|--------|
+| Node.js runtime | ~30 MB | Documents release assets |
 | Backend (NestJS API) | ~50 MB | GitHub Releases |
-| PostgreSQL 17.6 + pgvector + Apache AGE | ~200 MB | GitHub Releases |
+| PostgreSQL 17.6 + pgvector + Apache AGE | ~10 MB | Documents release assets |
 
-**Total: ~250 MB.** The download happens once and the files are stored in the
+**Total: depends on the Models variant.** The download happens once and the files are stored in the
 application's user-data directory.
 
 Document embeddings (semantic search / RAG) are stored in PostgreSQL via the
 `vector` (pgvector) extension — there is no separate vector service. The
-embedded PostgreSQL is the zonky binaries repackaged with pgvector baked in
-(`./build-release postgres`, which pulls the prebuilt extension `.deb` from the
-PostgreSQL APT repository), so the server has vector support out of the box.
+embedded PostgreSQL is compiled with pgvector and Apache AGE from pinned,
+checksum-verified source archives (`./build-release postgres --version <version>`),
+so the server has both extensions out of the box.
 The same database includes Apache AGE for the entity graph.
 
 ## Optional AI Features
@@ -79,41 +83,56 @@ Once installed, the local server is controlled from **Settings → Local Server*
 
 ## Building Standalone Assets
 
-To produce the Electron installer and the backend release asset, run
-`build-standalone` from the repository root:
+Run `build-release` from the repository root. The Frontend is copied to an
+isolated staging directory and versioned there, so the release build never
+modifies `frontend/package.json` or its lockfile:
 
 ```bash
-# Build backend asset and Electron installer
-./build-standalone all
+# Build the complete standalone target
+./build-release all --version 1.0.0 --llama-server /path/to/llama-server
 
 # Build only the lightweight installer (~150 MB)
-./build-standalone installer
+./build-release frontend --version 1.0.0
 
 # Build the backend release asset (~50 MB)
-./build-standalone backend
+./build-release backend --version 1.0.0
+
+# Build the pinned Node.js runtime
+./build-release node --version 1.0.0
 
 # Build the models service (CPU variant, ~2 GB)
-./build-standalone models-cpu
+./build-release models --version 1.0.0 --variant cpu \
+  --llama-server /path/to/llama-server
 
 # Build the models service (GPU/CUDA variant, ~5 GB)
-./build-standalone models-gpu
+./build-release models --version 1.0.0 --variant cuda \
+  --llama-server /path/to/llama-server
 ```
+
+The Node source checksum is pinned per target in `release.config.json`;
+`NODE_ARCHIVE_SHA256` may override it for a controlled build.
+The PostgreSQL build compiles PostgreSQL, pgvector and Apache AGE from the
+pinned source archives declared in `release.config.json`. If the host lacks
+the native toolchain, it uses the pinned Debian builder image through Docker.
 
 ### Recommended Release Workflow
 
-1. Run `./build-standalone backend` to produce the backend archive.
-2. Upload the files in `release-assets/` to a GitHub Release.
-3. Run `./build-standalone installer` to produce the platform installer.
-4. Distribute the installer found in `frontend/out/make/`.
+1. Build each component on a host matching its target platform.
+2. Run `./build-release verify --version <version>` against the assembled
+   `release-output/<version>/` directory.
+3. Upload the complete release directory without changing its relative paths.
+4. Distribute the installer from `release-output/<version>/installers/`.
 
-The installer itself is small because the databases and backend are fetched at
-runtime directly from their official sources or from GitHub Releases — nothing
-except the Electron shell is bundled in the installer.
+The installer itself is small because Node.js, PostgreSQL, Backend and Models are
+fetched from the release channel at runtime; only the Electron application is
+bundled in the installer.
 
-## Supported Platforms
+## Supported Build Target
 
 | Platform | Architecture |
 |----------|-------------|
-| Linux | x64, arm64 |
-| macOS | x64 (Intel), arm64 (Apple Silicon) |
-| Windows | x64 |
+| Linux | x64 |
+
+Linux arm64, Windows, and macOS remain planned targets. They are not considered
+standalone-capable until native Backend, PostgreSQL, Models, and Frontend assets
+pass the complete release verification on that target.
