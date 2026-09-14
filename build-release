@@ -10,18 +10,20 @@ show_help() {
 Documents release builder
 
 Usage:
-  ./build-release <command> --version <semver> [options]
+  ./build-release <components|command> --version <semver> [options]
 
 Commands:
   all             Build the complete standalone target
-  node            Build the bundled Node.js runtime
-  backend         Build Backend
-  postgres        Build embedded PostgreSQL
-  models          Build Models (default variant: cpu)
+  COMPONENTS      Build one or more comma-separated components:
+                  node, backend, postgres, models, frontend
+                  Examples: backend, frontend, backend,models
+
+Component aliases:
   models-cpu      Alias for models --variant cpu
   models-gpu      Alias for models --variant cuda
-  frontend        Build the Electron installer
   installer       Alias for frontend
+
+Other commands:
   verify          Verify an existing release directory
   serve           Serve an existing release directory locally
   clean           Remove release staging/output
@@ -35,10 +37,6 @@ Options:
   --frontend-format deb|rpm|squirrel|zip
   --standalone-local          Use local release artifacts after installation
   --port PORT
-
-NODE_ARCHIVE_SHA256 can override the checksum pinned in release.config.json.
-PostgreSQL, pgvector, AGE and llama-server are built from pinned sources in that
-configuration.
 EOF
 }
 
@@ -87,8 +85,6 @@ fi
 
 [ -n "$VERSION" ] || die "--version is required" 2
 validate_semver "$VERSION"
-[ "$STANDALONE_LOCAL" -eq 0 ] || [ "$COMMAND" = "all" ] ||
-  die "--standalone-local is only supported with the all command" 2
 TARGET="${TARGET:-$(detect_target)}"
 OUTPUT="${OUTPUT:-$ROOT_DIR/release-output/$VERSION}"
 assert_inside_workspace "$OUTPUT"
@@ -134,17 +130,46 @@ POSTGRES_BUILDER_IMAGE="$(node -p "require('$CONFIG').builders?.postgresLinuxX64
 LLAMA_CPP_REPOSITORY="$(node -p "require('$CONFIG').sources?.llamaCpp?.repository || ''")"
 LLAMA_CPP_REVISION="$(node -p "require('$CONFIG').sources?.llamaCpp?.revision || ''")"
 
+BUILD_ALL=0
+SELECTED_COMPONENTS=()
+if [ "$COMMAND" = "all" ]; then
+  BUILD_ALL=1
+  SELECTED_COMPONENTS=(node backend postgres models frontend)
+else
+  IFS=',' read -r -a SELECTED_COMPONENTS <<< "$COMMAND"
+  [ "${#SELECTED_COMPONENTS[@]}" -gt 0 ] || die "At least one component is required" 2
+  for component in "${SELECTED_COMPONENTS[@]}"; do
+    case "$component" in
+      node|backend|postgres|models|frontend) ;;
+      *) die "Unsupported release component: $component" 2 ;;
+    esac
+  done
+fi
+
+component_requested() {
+  local component="$1"
+  local selected
+  for selected in "${SELECTED_COMPONENTS[@]}"; do
+    [ "$selected" = "$component" ] && return 0
+  done
+  return 1
+}
+
+if [ "$STANDALONE_LOCAL" -eq 1 ] && ! component_requested frontend; then
+  die "--standalone-local requires the frontend component" 2
+fi
+
 preflight_selected_components() {
-  if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "backend" ]; then
+  if component_requested backend; then
     local active_node
     active_node="$(node -p 'process.versions.node')"
     [ "$active_node" = "$NODE_VERSION" ] ||
       die "Backend requires Node $NODE_VERSION on the build host (current: $active_node)" 3
   fi
-  if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "node" ]; then
+  if component_requested node; then
     [ -n "$NODE_ARCHIVE_SHA256_VALUE" ] || die "Node archive checksum is not configured for $TARGET" 3
   fi
-  if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "models" ]; then
+  if component_requested models; then
     local active_python
     active_python="$(python3 -c 'import platform; print(platform.python_version())')"
     [ "$active_python" = "$PYTHON_VERSION" ] ||
@@ -152,7 +177,7 @@ preflight_selected_components() {
     [ -n "$LLAMA_CPP_REPOSITORY" ] && [ -n "$LLAMA_CPP_REVISION" ] ||
       die "llama.cpp source is not configured" 3
   fi
-  if [ "$COMMAND" = "all" ] || [ "$COMMAND" = "postgres" ]; then
+  if component_requested postgres; then
     [ -n "$POSTGRES_SOURCE_URL" ] && [ -n "$POSTGRES_SOURCE_SHA256" ] || die "PostgreSQL source is not configured" 3
     [ -n "$PGVECTOR_SOURCE_URL" ] && [ -n "$PGVECTOR_SOURCE_SHA256" ] || die "pgvector source is not configured" 3
     [ -n "$AGE_SOURCE_URL" ] && [ -n "$AGE_SOURCE_SHA512" ] || die "Apache AGE source is not configured" 3
@@ -218,25 +243,18 @@ write_manifest() {
     --version "$VERSION" --target "$TARGET" --output "$OUTPUT" --metadata "$OUTPUT/.metadata/$TARGET"
 }
 
-case "$COMMAND" in
-  node) package_node ;;
-  backend) package_backend ;;
-  postgres) package_postgres ;;
-  models) package_models ;;
-  frontend) package_frontend ;;
-  all)
-    package_node
-    package_backend
-    package_postgres
-    package_models
+component_requested node && package_node
+component_requested backend && package_backend
+component_requested postgres && package_postgres
+component_requested models && package_models
+if [ "$STANDALONE_LOCAL" -eq 1 ]; then
     write_manifest
-    package_frontend
-    ;;
-  *) die "Unknown release command: $COMMAND" 2 ;;
-esac
+  DOCUMENTS_REQUIRE_STANDALONE=1 node "$ROOT_DIR/scripts/release/verify-release.mjs" "$OUTPUT"
+fi
+component_requested frontend && package_frontend
 
 write_manifest
-if [ "$COMMAND" = "all" ]; then
+if [ "$BUILD_ALL" -eq 1 ] || [ "$STANDALONE_LOCAL" -eq 1 ]; then
   DOCUMENTS_REQUIRE_STANDALONE=1 node "$ROOT_DIR/scripts/release/verify-release.mjs" "$OUTPUT"
 else
   node "$ROOT_DIR/scripts/release/verify-release.mjs" "$OUTPUT"

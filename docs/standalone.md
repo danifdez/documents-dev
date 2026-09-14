@@ -94,6 +94,9 @@ modifies `frontend/package.json` or its lockfile:
 # Build an installer that uses this local release directory at runtime
 ./build-release all --version 1.0.0 --standalone-local
 
+# Rebuild only Backend and the installer in an existing complete release
+./build-release backend,frontend --version 1.0.0 --standalone-local
+
 # Build only the lightweight installer (~150 MB)
 ./build-release frontend --version 1.0.0
 
@@ -122,6 +125,12 @@ the generated Node, Backend, PostgreSQL and Models archives from its local
 `release-output/<version>/` directory. The first-run setup verifies and installs
 them into the normal user-data paths without GitHub, HTTP or environment
 variables. The output directory must remain available on that machine.
+
+To iterate on a release without rebuilding large unchanged components, pass the
+components to rebuild as the first argument, separated by commas. For example,
+`backend,frontend` updates those two artifacts, retains the existing component
+metadata, then verifies the resulting complete release. This requires that the
+output directory already contains a valid complete release for that version.
 
 ### Recommended Release Workflow
 
