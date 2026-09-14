@@ -91,6 +91,10 @@ modifies `frontend/package.json` or its lockfile:
 # Build the complete standalone target
 ./build-release all --version 1.0.0 --llama-server /path/to/llama-server
 
+# Build an installer that uses this local release directory at runtime
+./build-release all --version 1.0.0 --standalone-local \
+  --llama-server /path/to/llama-server
+
 # Build only the lightweight installer (~150 MB)
 ./build-release frontend --version 1.0.0
 
@@ -114,6 +118,12 @@ The Node source checksum is pinned per target in `release.config.json`;
 The PostgreSQL build compiles PostgreSQL, pgvector and Apache AGE from the
 pinned source archives declared in `release.config.json`. If the host lacks
 the native toolchain, it uses the pinned Debian builder image through Docker.
+
+`--standalone-local` keeps the installer lightweight and configures it to copy
+the generated Node, Backend, PostgreSQL and Models archives from its local
+`release-output/<version>/` directory. The first-run setup verifies and installs
+them into the normal user-data paths without GitHub, HTTP or environment
+variables. The output directory must remain available on that machine.
 
 ### Recommended Release Workflow
 

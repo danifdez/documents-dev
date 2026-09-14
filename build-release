@@ -34,6 +34,7 @@ Options:
   --variant cpu|cuda|metal
   --llama-server PATH
   --frontend-format deb|rpm|squirrel|zip
+  --standalone-local          Use local release artifacts after installation
   --port PORT
 
 NODE_ARCHIVE_SHA256 can override the checksum pinned in release.config.json.
@@ -50,6 +51,7 @@ OUTPUT=""
 VARIANT="cpu"
 LLAMA_SERVER="${LLAMA_SERVER_BIN:-}"
 FRONTEND_FORMAT="deb"
+STANDALONE_LOCAL=0
 PORT="8000"
 
 case "$COMMAND" in
@@ -66,6 +68,7 @@ while [ "$#" -gt 0 ]; do
     --variant) VARIANT="$2"; shift 2 ;;
     --llama-server) LLAMA_SERVER="$2"; shift 2 ;;
     --frontend-format) FRONTEND_FORMAT="$2"; shift 2 ;;
+    --standalone-local) STANDALONE_LOCAL=1; shift ;;
     --port) PORT="$2"; shift 2 ;;
     *) die "Unknown release argument: $1" 2 ;;
   esac
@@ -87,6 +90,8 @@ fi
 
 [ -n "$VERSION" ] || die "--version is required" 2
 validate_semver "$VERSION"
+[ "$STANDALONE_LOCAL" -eq 0 ] || [ "$COMMAND" = "all" ] ||
+  die "--standalone-local is only supported with the all command" 2
 TARGET="${TARGET:-$(detect_target)}"
 OUTPUT="${OUTPUT:-$ROOT_DIR/release-output/$VERSION}"
 assert_inside_workspace "$OUTPUT"
@@ -197,9 +202,19 @@ package_models() {
 }
 
 package_frontend() {
-  "$ROOT_DIR/frontend/scripts/package-release.sh" \
+  local args=(
     --version "$VERSION" --target "$TARGET" --format "$FRONTEND_FORMAT" \
     --staging "$STAGING_ROOT/frontend" --output "$OUTPUT"
+  )
+  if [ "$STANDALONE_LOCAL" -eq 1 ]; then
+    args+=(--local-release-dir "$OUTPUT")
+  fi
+  "$ROOT_DIR/frontend/scripts/package-release.sh" "${args[@]}"
+}
+
+write_manifest() {
+  node "$ROOT_DIR/scripts/release/manifest.mjs" \
+    --version "$VERSION" --target "$TARGET" --output "$OUTPUT" --metadata "$OUTPUT/.metadata/$TARGET"
 }
 
 case "$COMMAND" in
@@ -213,13 +228,13 @@ case "$COMMAND" in
     package_backend
     package_postgres
     package_models
+    write_manifest
     package_frontend
     ;;
   *) die "Unknown release command: $COMMAND" 2 ;;
 esac
 
-node "$ROOT_DIR/scripts/release/manifest.mjs" \
-  --version "$VERSION" --target "$TARGET" --output "$OUTPUT" --metadata "$OUTPUT/.metadata/$TARGET"
+write_manifest
 if [ "$COMMAND" = "all" ]; then
   DOCUMENTS_REQUIRE_STANDALONE=1 node "$ROOT_DIR/scripts/release/verify-release.mjs" "$OUTPUT"
 else
