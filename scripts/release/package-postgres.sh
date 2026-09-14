@@ -100,6 +100,8 @@ log_info "Building PostgreSQL ${POSTGRES_VERSION}"
   --prefix="$RUNTIME" --without-readline --without-icu --without-ldap --without-pam --without-gssapi)
 run_logged "$LOG_FILE.postgres.build" make -C "$POSTGRES_SOURCE" -j"$JOBS"
 run_logged "$LOG_FILE.postgres.install" make -C "$POSTGRES_SOURCE" install
+run_logged "$LOG_FILE.postgres.contrib.pg-trgm" make -C "$POSTGRES_SOURCE/contrib/pg_trgm" install
+run_logged "$LOG_FILE.postgres.contrib.unaccent" make -C "$POSTGRES_SOURCE/contrib/unaccent" install
 
 PG_CONFIG="$RUNTIME/bin/pg_config"
 require_file "$PG_CONFIG"
@@ -113,6 +115,8 @@ require_file "$RUNTIME/lib/vector.so"
 require_file "$RUNTIME/share/extension/vector.control"
 require_file "$RUNTIME/lib/age.so"
 require_file "$RUNTIME/share/extension/age.control"
+require_file "$RUNTIME/share/extension/pg_trgm.control"
+require_file "$RUNTIME/share/extension/unaccent.control"
 
 PG_BIN="$RUNTIME/bin"
 PG_LIB="$RUNTIME/lib"
@@ -126,7 +130,7 @@ else
   POSTGRES_SMOKE=(env "LD_LIBRARY_PATH=$PG_LIB")
 fi
 "${POSTGRES_SMOKE[@]}" "$PG_BIN/initdb" -D "$SMOKE_DATA" -U documents --auth=trust --no-locale >"$LOG_FILE.smoke" 2>&1
-printf 'CREATE EXTENSION vector;\nCREATE EXTENSION age;\n' |
+printf 'CREATE EXTENSION pg_trgm;\nCREATE EXTENSION unaccent;\nCREATE EXTENSION vector;\nCREATE EXTENSION age;\n' |
   "${POSTGRES_SMOKE[@]}" "$PG_BIN/postgres" --single -D "$SMOKE_DATA" postgres >>"$LOG_FILE.smoke" 2>&1
 
 rm -rf "$SMOKE_DATA" "$DOWNLOADS" "$SOURCES" "$RUNTIME/include" "$RUNTIME/lib/pgxs"
@@ -136,7 +140,7 @@ import fs from 'node:fs';
 const [, , file, release, target, postgres] = process.argv;
 fs.writeFileSync(file, `${JSON.stringify({
   schemaVersion: 1, component: 'postgres', version: `${postgres}+documents.${release}`,
-  release, target, entrypoint: 'bin/postgres', extensions: ['vector', 'age'],
+  release, target, entrypoint: 'bin/postgres', extensions: ['pg_trgm', 'unaccent', 'vector', 'age'],
   createdAt: new Date().toISOString(),
 }, null, 2)}\n`);
 NODE
@@ -149,7 +153,7 @@ import fs from 'node:fs';
 const [, , file, release, target, artifact, postgres] = process.argv;
 fs.writeFileSync(file, `${JSON.stringify({
   component: 'postgres', version: `${postgres}+documents.${release}`,
-  target, artifact, runtime: { postgres }, requires: { extensions: ['vector', 'age'] },
+  target, artifact, runtime: { postgres }, requires: { extensions: ['pg_trgm', 'unaccent', 'vector', 'age'] },
 }, null, 2)}\n`);
 NODE
 
