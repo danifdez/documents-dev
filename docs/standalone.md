@@ -106,11 +106,14 @@ modifies `frontend/package.json` or its lockfile:
 # Build the pinned Node.js runtime
 ./build-release node --version 1.0.0
 
-# Build the models service (CPU variant, ~2 GB)
-./build-release models --version 1.0.0 --variant cpu
+# Build the models service (CPU and platform GPU variants, ~2 GB + ~5 GB)
+./build-release models --version 1.0.0
 
-# Build the models service (GPU/CUDA variant, ~5 GB)
-./build-release models --version 1.0.0 --variant cuda
+# Build only the CPU variant (~2 GB)
+./build-release models-cpu --version 1.0.0
+
+# Build only the CUDA variant (~5 GB)
+./build-release models-gpu --version 1.0.0
 ```
 
 The Node source checksum is pinned per target in `release.config.json`;

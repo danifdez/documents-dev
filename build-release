@@ -19,9 +19,11 @@ Commands:
                   Examples: backend, frontend, backend,models
 
 Component aliases:
-  models-cpu      Alias for models --variant cpu
-  models-gpu      Alias for models --variant cuda
-  installer       Alias for frontend
+  models-cpu      Build only the CPU models variant
+  models-gpu      Build only the CUDA models variant
+
+Models builds the CPU variant plus the platform GPU variant (CUDA, or Metal on
+macOS) by default.
 
 Other commands:
   verify          Verify an existing release directory
@@ -33,10 +35,7 @@ Options:
   --version VERSION
   --target OS-ARCH
   --output DIR
-  --variant cpu|cuda|metal
-  --frontend-format deb|rpm|squirrel|zip
   --standalone-local          Use local release artifacts after installation
-  --port PORT
 EOF
 }
 
@@ -45,15 +44,12 @@ COMMAND="${1:-help}"
 VERSION="${RELEASE_VERSION:-}"
 TARGET=""
 OUTPUT=""
-VARIANT="cpu"
-FRONTEND_FORMAT="deb"
+MODELS_VARIANT=""
 STANDALONE_LOCAL=0
-PORT="8000"
 
 case "$COMMAND" in
-  models-cpu) COMMAND="models"; VARIANT="cpu" ;;
-  models-gpu) COMMAND="models"; VARIANT="cuda" ;;
-  installer) COMMAND="frontend" ;;
+  models-cpu) COMMAND="models"; MODELS_VARIANT="cpu" ;;
+  models-gpu) COMMAND="models"; MODELS_VARIANT="cuda" ;;
 esac
 
 while [ "$#" -gt 0 ]; do
@@ -61,10 +57,7 @@ while [ "$#" -gt 0 ]; do
     --version) VERSION="$2"; shift 2 ;;
     --target) TARGET="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
-    --variant) VARIANT="$2"; shift 2 ;;
-    --frontend-format) FRONTEND_FORMAT="$2"; shift 2 ;;
     --standalone-local) STANDALONE_LOCAL=1; shift ;;
-    --port) PORT="$2"; shift 2 ;;
     *) die "Unknown release argument: $1" 2 ;;
   esac
 done
@@ -98,9 +91,9 @@ fi
 
 if [ "$COMMAND" = "serve" ]; then
   [ -f "$OUTPUT/release.json" ] || die "Release manifest not found: $OUTPUT/release.json" 3
-  log_info "Serving $OUTPUT on http://127.0.0.1:$PORT"
+  log_info "Serving $OUTPUT on http://127.0.0.1:8000"
   cd "$OUTPUT"
-  exec python3 -m http.server "$PORT" --bind 127.0.0.1
+  exec python3 -m http.server 8000 --bind 127.0.0.1
 fi
 
 CONFIG="$ROOT_DIR/release.config.json"
@@ -216,20 +209,41 @@ package_postgres() {
   fi
 }
 
+models_variants() {
+  if [ -n "$MODELS_VARIANT" ]; then
+    printf '%s\n' "$MODELS_VARIANT"
+    return 0
+  fi
+  case "$TARGET" in
+    darwin-*) printf 'cpu\nmetal\n' ;;
+    *) printf 'cpu\ncuda\n' ;;
+  esac
+}
+
 package_models() {
-  local args=(
-    --version "$VERSION" --target "$TARGET" --variant "$VARIANT" \
-    --llama-cpp-repository "$LLAMA_CPP_REPOSITORY" --llama-cpp-revision "$LLAMA_CPP_REVISION" \
-    --pyinstaller-version "$PYINSTALLER_VERSION" \
-    --pip-version "$PIP_VERSION" --python-version "$PYTHON_VERSION" \
-    --staging "$STAGING_ROOT/models-$VARIANT" --output "$OUTPUT"
-  )
-  "$ROOT_DIR/models/scripts/package-release.sh" "${args[@]}"
+  local variant
+  while IFS= read -r variant; do
+    "$ROOT_DIR/models/scripts/package-release.sh" \
+      --version "$VERSION" --target "$TARGET" --variant "$variant" \
+      --llama-cpp-repository "$LLAMA_CPP_REPOSITORY" --llama-cpp-revision "$LLAMA_CPP_REVISION" \
+      --pyinstaller-version "$PYINSTALLER_VERSION" \
+      --pip-version "$PIP_VERSION" --python-version "$PYTHON_VERSION" \
+      --staging "$STAGING_ROOT/models-$variant" --output "$OUTPUT"
+  done < <(models_variants)
+}
+
+frontend_format() {
+  case "$TARGET" in
+    linux-*) printf 'deb\n' ;;
+    win32-*) printf 'squirrel\n' ;;
+    darwin-*) printf 'zip\n' ;;
+    *) die "Unsupported Frontend target: $TARGET" 2 ;;
+  esac
 }
 
 package_frontend() {
   local args=(
-    --version "$VERSION" --target "$TARGET" --format "$FRONTEND_FORMAT" \
+    --version "$VERSION" --target "$TARGET" --format "$(frontend_format)" \
     --staging "$STAGING_ROOT/frontend" --output "$OUTPUT"
   )
   if [ "$STANDALONE_LOCAL" -eq 1 ]; then
@@ -248,8 +262,11 @@ component_requested backend && package_backend
 component_requested postgres && package_postgres
 component_requested models && package_models
 if [ "$STANDALONE_LOCAL" -eq 1 ]; then
-    write_manifest
-  DOCUMENTS_REQUIRE_STANDALONE=1 node "$ROOT_DIR/scripts/release/verify-release.mjs" "$OUTPUT"
+  # The Frontend packaging embeds the local release directory and requires
+  # release.json and checksums.sha256 to exist, so write the manifest now but
+  # defer verification: the standalone contract needs the Frontend artifact,
+  # which is not built yet.
+  write_manifest
 fi
 component_requested frontend && package_frontend
 
